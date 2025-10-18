@@ -1,0 +1,198 @@
+# --- 1. Installation of All Necessary Libraries ---
+# Using subprocess to ensure these are installed in the environment.
+import subprocess
+import sys
+
+def install(package):
+    subprocess.check_call([sys.executable, "-m", "pip", "install", package, "--quiet"])
+
+# Install necessary libraries for the app to function
+try:
+    import gradio as gr
+    import torch
+    from transformers import AutoTokenizer, AutoModelForSequenceClassification
+    from peft import PeftModel
+except ImportError:
+    print("Installing required libraries: gradio, torch, transformers, peft, datasets...")
+    install("gradio")
+    install("torch")
+    install("transformers")
+    install("peft")
+    install("datasets")
+    print("✅ Installation complete.")
+    # Import again after installation
+    import gradio as gr
+    import torch
+    from transformers import AutoTokenizer, AutoModelForSequenceClassification
+    from peft import PeftModel
+
+# --- 2. Configuration and Label Mapping ---
+# Define the models we'll be using from Hugging Face
+BASE_MODEL = "roberta-base"
+LORA_ADAPTERS = "Feargal/roberta-lora-disinformation-final"
+DEVICE = "cpu" # Forcing CPU as requested for speed testing
+MC_SAMPLES = 15 # Number of forward passes for Monte Carlo Dropout
+
+# The label mapping we figured out from the class distribution chart
+id2label = {
+    0: "True",
+    1: "Manipulated Content",
+    2: "Satire/Parody",
+    3: "Imposter Content",
+    4: "Misleading Content",
+    5: "False Connection"
+}
+
+# --- 3. Model Loading and Optimization ---
+def load_optimized_model():
+    """
+    Loads the roberta-base model, attaches the specified LoRA adapters,
+    and merges them to create a single, fast model for CPU inference.
+    """
+    print("Loading base model and tokenizer...")
+    tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL)
+    model = AutoModelForSequenceClassification.from_pretrained(
+        BASE_MODEL,
+        num_labels=len(id2label),
+        id2label=id2label,
+        label2id={v: k for k, v in id2label.items()}
+    )
+
+    print(f"Loading LoRA adapters from {LORA_ADAPTERS}...")
+    model = PeftModel.from_pretrained(model, LORA_ADAPTERS)
+
+    print("Merging LoRA weights into the base model for maximum speed...")
+    model = model.merge_and_unload()
+
+    model.to(DEVICE)
+    # Start in eval mode, will be toggled for MC Dropout
+    model.eval()
+
+    print("✅ Model loaded and optimized for CPU inference.")
+    return tokenizer, model
+
+# Load the model and tokenizer once when the script starts
+tokenizer, model = load_optimized_model()
+
+# --- 4. Inference Function with Monte Carlo Dropout ---
+def classify_text(text_input):
+    """
+    Takes text input, runs N forward passes with dropout enabled (Monte Carlo Dropout)
+    to calculate both the prediction and the model's uncertainty.
+    """
+    if not text_input or not text_input.strip():
+        return "N/A", "N/A", {}
+
+    # Tokenize the input text
+    inputs = tokenizer(text_input, return_tensors="pt", truncation=True, padding=True, max_length=512).to(DEVICE)
+
+    # --- Monte Carlo Dropout Inference ---
+    # Activate dropout layers for uncertainty estimation
+    model.train()
+
+    all_probs = []
+    with torch.no_grad():
+        for _ in range(MC_SAMPLES):
+            logits = model(**inputs).logits
+            probabilities = torch.softmax(logits, dim=1)
+            all_probs.append(probabilities)
+
+    # Deactivate dropout layers
+    model.eval()
+
+    # Calculate mean probabilities across all passes
+    stacked_probs = torch.stack(all_probs)
+    mean_probs = stacked_probs.mean(dim=0)[0]
+
+    # Calculate uncertainty using predictive entropy
+    # A higher entropy value indicates higher uncertainty.
+    entropy = -torch.sum(mean_probs * torch.log(mean_probs + 1e-9)).item()
+    uncertainty_score = f"{entropy:.4f} (Higher is more uncertain)"
+
+    # Get the final predicted label from the mean probabilities
+    predicted_id = torch.argmax(mean_probs).item()
+    predicted_label = id2label[predicted_id]
+
+    # Create the dictionary for the ranked progress bars
+    confidence_scores = {id2label[i]: prob.item() for i, prob in enumerate(mean_probs)}
+
+    return predicted_label, uncertainty_score, confidence_scores
+
+# --- 5. Gradio Interface ---
+# Define a modern, minimalistic theme
+modern_theme = gr.themes.Base(
+    primary_hue=gr.themes.colors.blue,
+    secondary_hue=gr.themes.colors.blue,
+    neutral_hue=gr.themes.colors.slate,
+).set(
+    body_background_fill="#111111",
+    body_background_fill_dark="#111111",
+    body_text_color="white",
+    body_text_color_dark="white",
+    background_fill_primary="#222222",
+    background_fill_primary_dark="#222222",
+    block_background_fill="#222222",
+    block_background_fill_dark="#222222",
+    block_label_background_fill="#111111",
+    block_label_background_fill_dark="#111111",
+    block_title_text_color="*primary_500",
+    block_title_text_color_dark="*primary_500",
+    button_primary_background_fill="*primary_600",
+    button_primary_background_fill_hover="*primary_500",
+    button_primary_text_color="white",
+    border_color_accent_dark="*primary_600",
+    border_color_primary_dark="*neutral_700",
+    link_text_color="*primary_400",
+    link_text_color_hover="*primary_300",
+    link_text_color_visited="*primary_500",
+)
+
+
+with gr.Blocks(theme=modern_theme, title="Disinformation Detector", css=".gradio-container {background: #111111}") as demo:
+    gr.Markdown(
+        """
+        <div style="text-align: center; padding: 20px;">
+            <h1 style="color: #FFFFFF; font-size: 2.5em;">🕵️ Disinformation Detector</h1>
+            <p style="color: #CCCCCC; font-size: 1.1em;">Enter a news headline or text to classify its disinformation type.</p>
+        </div>
+        """
+    )
+    with gr.Row():
+        with gr.Column(scale=3):
+            text_input = gr.Textbox(
+                lines=5,
+                label="Text to Classify",
+                placeholder="e.g., 'My plane hit an orca right after takeoff...'"
+            )
+            submit_button = gr.Button("Analyze", variant="primary")
+        with gr.Column(scale=2):
+            predicted_label_output = gr.Textbox(label="Top Prediction", interactive=False)
+            uncertainty_output = gr.Textbox(label="Uncertainty Score (Entropy)", interactive=False)
+
+    gr.Markdown("<hr style='border: 1px solid #333;'/>")
+
+    gr.Markdown(
+        "<h3 style='text-align: center; color: #FFFFFF;'>Prediction Breakdown</h3>"
+    )
+    confidence_scores_output = gr.Label(label="Ranked Probabilities", num_top_classes=6)
+
+    submit_button.click(
+        fn=classify_text,
+        inputs=text_input,
+        outputs=[predicted_label_output, uncertainty_output, confidence_scores_output]
+    )
+
+    gr.Examples(
+        [
+            ["New 'Natural Feeding' trend has parents puking on babies"],
+            ["My plane hit an orca right after takeoff"],
+            ["Maryland drive gets probation for Delaware crash that killed 5 NJ family members"],
+            ["Neuroscience Says Doing This 1 Thing Makes You Just as Happy as Eating 2,000 Chocolate Bars"],
+        ],
+        inputs=text_input
+    )
+
+# --- 6. Launch the Application ---
+if __name__ == "__main__":
+    print("Launching Gradio interface...")
+    demo.launch(debug=False)
