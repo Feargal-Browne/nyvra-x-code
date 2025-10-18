@@ -1,0 +1,368 @@
+# Imports
+import gc
+import logging
+import os
+import random
+import warnings
+import time
+from pathlib import Path
+from dataclasses import dataclass, field
+from typing import Dict, Tuple
+import shutil
+
+import joblib
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import seaborn as sns
+import torch
+import torch.nn as nn
+import wandb
+
+# Hugging Face Imports
+from huggingface_hub import HfApi, login as hf_login
+from datasets import Dataset, load_from_disk, Features, ClassLabel, Value
+from transformers import (
+    AutoTokenizer, AutoModelForSequenceClassification,
+    TrainingArguments, Trainer, DataCollatorWithPadding, set_seed as hf_set_seed
+)
+# PEFT library for LoRA
+from peft import PeftModel
+
+# Scikit-learn Imports
+from scipy.special import softmax
+from sklearn.preprocessing import LabelEncoder
+from sklearn.metrics import (
+    f1_score, accuracy_score, classification_report,
+    average_precision_score, confusion_matrix, brier_score_loss
+)
+from sklearn.utils.class_weight import compute_class_weight
+
+
+# Basic Configuration
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+warnings.filterwarnings("ignore")
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+os.environ["WANDB_LOG_MODEL"] = "checkpoint"
+
+# ==============================================================================
+# 2. CONFIGURATION DATACLASS
+# ==============================================================================
+@dataclass
+class ScriptConfig:
+    # Project and Path Configs
+    project_name: str = "Disinformation-Detection-T4-Stable"
+    output_dir: Path = Path("roberta-base-LORA-RETRAINED")
+    cache_dir: Path = Path("/content/cache")
+    model_name_or_path: str = "roberta-base"
+    lora_adapter_path: str = "Feargal/roberta-lora-disinformation-v6"
+    hf_repo_name: str = "Feargal/roberta-base-multi-label-LORA-retrained"
+
+    # Data Configs
+    train_file: Path = Path("./all_train.tsv")
+    val_file: Path = Path("./all_validate.tsv")
+    text_col: str = "title"
+    label_col: str = "6_way_label"
+    max_length: int = 256
+
+    # Model & Training Hyperparameters
+    num_train_epochs: int = 5
+    batch_size: int = 128 # 64 * 3 = 192
+    eval_batch_size: int = 128
+    gradient_accumulation_steps: int = 2
+    eval_steps: int = 750
+    save_steps: int = 750
+    logging_steps: int = 25
+    lr: float = 0.00013079373279230666
+    weight_decay: float = 2.925368559272793e-06
+    adam_beta2: float = 0.9988092277749205
+    dropout: float = 0.08246747869081807
+    lr_scheduler_type: str = 'linear'
+    warmup_ratio: float = 0.09684324847954481
+    optim: str = "adamw_torch"
+    seed: int = 42
+    num_workers: int = field(default_factory=lambda: os.cpu_count() or 1)
+
+def set_seed(seed_value: int):
+    random.seed(seed_value)
+    np.random.seed(seed_value)
+    torch.manual_seed(seed_value)
+    hf_set_seed(seed_value)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed_value)
+
+# ==============================================================================
+# 3. CUSTOM TRAINER FOR CLASS WEIGHTS
+# ==============================================================================
+class WeightedTrainer(Trainer):
+    def __init__(self, *args, class_weights=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        if class_weights is not None:
+            logging.info("Using class weights for loss calculation.")
+            self.class_weights = torch.tensor(class_weights, dtype=torch.float32).to(self.args.device)
+        else:
+            self.class_weights = None
+
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        labels = inputs.pop("labels")
+        outputs = model(**inputs)
+        logits = outputs.get("logits")
+        # Ensure the weight tensor is on the same device as the logits
+        loss_fct = nn.CrossEntropyLoss(weight=self.class_weights.to(logits.device))
+        loss = loss_fct(logits.view(-1, self.model.config.num_labels), labels.view(-1))
+        return (loss, outputs) if return_outputs else loss
+
+# ==============================================================================
+# 4. DATA HANDLING FUNCTIONS (Unchanged)
+# ==============================================================================
+def load_and_clean_data(config: ScriptConfig) -> Tuple[Dataset, LabelEncoder]:
+    cleaned_data_path = config.cache_dir / "cleaned_dataset"
+    label_encoder_path = config.cache_dir / "label_encoder.joblib"
+    config.cache_dir.mkdir(exist_ok=True, parents=True)
+
+    if cleaned_data_path.exists() and label_encoder_path.exists():
+        logging.info(f"✅ Loading cleaned dataset AND LabelEncoder from cache...")
+        cleaned_dataset = load_from_disk(str(cleaned_data_path))
+        le = joblib.load(label_encoder_path)
+        return cleaned_dataset, le
+
+    logging.warning("⚠️ Incomplete cache detected. Reprocessing from source files.")
+    if cleaned_data_path.exists():
+        logging.info(f"Removing incomplete cache directory: {cleaned_data_path}")
+        shutil.rmtree(cleaned_data_path)
+
+    logging.info("⏳ Processing from source files.")
+    required_cols = [config.text_col, config.label_col]
+    df_train = pd.read_csv(config.train_file, sep='\t', usecols=required_cols, on_bad_lines='warn', encoding='latin-1')
+    df_val = pd.read_csv(config.val_file, sep='\t', usecols=required_cols, on_bad_lines='warn', encoding='latin-1')
+    df_combined = pd.concat([df_train.dropna(subset=required_cols), df_val.dropna(subset=required_cols)], ignore_index=True)
+
+    logging.info("Cleaning data: removing classes with fewer than 2 samples...")
+    class_counts = df_combined[config.label_col].value_counts()
+    classes_to_remove = class_counts[class_counts < 2].index
+    if not classes_to_remove.empty:
+        logging.warning(f"Removing {len(classes_to_remove)} classes with < 2 samples: {classes_to_remove.tolist()}")
+        df_combined = df_combined[~df_combined[config.label_col].isin(classes_to_remove)]
+
+    plt.figure(figsize=(12, 7))
+    sns.countplot(y=df_combined[config.label_col], order=df_combined[config.label_col].value_counts().index, palette="viridis")
+    plt.title('Class Distribution of Cleaned Dataset', fontsize=16)
+    plt.xlabel('Number of Samples'); plt.ylabel('Class Label')
+    plt.tight_layout()
+    dist_path = Path("./class_distribution.png")
+    plt.savefig(dist_path); plt.close()
+
+    if os.getenv("WANDB_MODE") != "disabled" and wandb.run:
+        wandb.log({"class_distribution": wandb.Image(str(dist_path))})
+
+    le = LabelEncoder()
+    df_combined['labels'] = le.fit_transform(df_combined[config.label_col].astype(str))
+    joblib.dump(le, label_encoder_path)
+
+    features = Features({config.text_col: Value("string"), 'labels': ClassLabel(names=le.classes_.tolist())})
+    full_dataset = Dataset.from_pandas(df_combined[[config.text_col, 'labels']], features=features)
+
+    logging.info(f"💾 Saving cleaned data to cache: {cleaned_data_path}")
+    full_dataset.save_to_disk(str(cleaned_data_path))
+
+    return full_dataset, le
+
+def tokenize_dataset(dataset: Dataset, tokenizer, config: ScriptConfig) -> Dataset:
+    model_name_slug = Path(config.model_name_or_path).name
+    tokenized_data_path = config.cache_dir / f"tokenized_{model_name_slug}_{config.max_length}"
+
+    if tokenized_data_path.exists():
+        logging.info(f"✅ Loading tokenized dataset from cache: {tokenized_data_path}")
+        return load_from_disk(str(tokenized_data_path))
+
+    logging.info(f"⏳ Tokenizing dataset with max_length={config.max_length}...")
+    def tokenize_function(examples):
+        return tokenizer(examples[config.text_col], truncation=True, max_length=config.max_length)
+
+    tokenized_dataset = dataset.map(
+        tokenize_function, batched=True, num_proc=config.num_workers, remove_columns=[config.text_col]
+    )
+
+    logging.info(f"💾 Saving tokenized data to cache: {tokenized_data_path}")
+    tokenized_dataset.save_to_disk(str(tokenized_data_path))
+
+    return tokenized_dataset
+
+def prepare_datasets(config: ScriptConfig, tokenizer) -> Tuple[Dataset, Dataset, Dataset, LabelEncoder, int, np.ndarray]:
+    cleaned_ds, le = load_and_clean_data(config)
+    tokenized_ds = tokenize_dataset(cleaned_ds, tokenizer, config)
+    num_classes = len(le.classes_)
+
+    all_labels = tokenized_ds['labels']
+    class_weights = compute_class_weight('balanced', classes=np.unique(all_labels), y=all_labels)
+    logging.info(f"Computed class weights: {class_weights}")
+
+    split_80_20 = tokenized_ds.train_test_split(test_size=0.2, stratify_by_column="labels", seed=config.seed)
+    train_ds, temp_ds = split_80_20['train'], split_80_20['test']
+    val_test_split = temp_ds.train_test_split(test_size=0.5, stratify_by_column="labels", seed=config.seed)
+    val_ds, test_ds = val_test_split['train'], val_test_split['test']
+
+    logging.info(f"Data ready. Train: {len(train_ds)}, Val: {len(val_ds)}, Test: {len(test_ds)}")
+    return train_ds, val_ds, test_ds, le, num_classes, class_weights
+
+
+# ==============================================================================
+# 5. EVALUATION & LOGGING FUNCTIONS (Unchanged)
+# ==============================================================================
+def compute_metrics(p) -> Dict[str, float]:
+    preds = np.argmax(p.predictions, axis=1)
+    labels = p.label_ids
+    probs = softmax(p.predictions, axis=1)
+
+    one_hot_labels = np.zeros_like(probs)
+    one_hot_labels[np.arange(len(labels)), labels] = 1
+    brier_score = np.mean([brier_score_loss(one_hot_labels[:, i], probs[:, i]) for i in range(probs.shape[1])])
+
+    metrics = {
+        "accuracy": accuracy_score(labels, preds),
+        "macro_f1": f1_score(labels, preds, average="macro"),
+        "brier_score": brier_score,
+        "pr_auc_macro": average_precision_score(one_hot_labels, probs, average="macro")
+    }
+
+    per_class_f1 = f1_score(labels, preds, average=None)
+    for i, f1 in enumerate(per_class_f1):
+        metrics[f"f1_class_{i}"] = f1
+
+    return metrics
+
+def log_final_visualizations(trainer, test_dataset, label_encoder, run_name):
+    logging.info("Generating final predictions and visualizations...")
+    test_results = trainer.predict(test_dataset)
+    preds, true_labels = np.argmax(test_results.predictions, axis=1), test_dataset['labels']
+    class_names = label_encoder.classes_
+
+    cm = confusion_matrix(true_labels, preds)
+    plt.figure(figsize=(10, 8))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=class_names, yticklabels=class_names)
+    plt.xlabel('Predicted Labels'); plt.ylabel('True Labels'); plt.title('Confusion Matrix')
+    cm_path = Path(f"./{run_name}_confusion_matrix.png")
+    plt.savefig(cm_path); plt.close()
+
+    if os.getenv("WANDB_MODE") != "disabled" and wandb.run:
+        wandb.log({"confusion_matrix": wandb.Image(str(cm_path))})
+        report = classification_report(true_labels, preds, target_names=class_names, output_dict=True)
+        report_df = pd.DataFrame(report).transpose()
+        wandb.log({"classification_report": wandb.Table(dataframe=report_df)})
+        logging.info(f"Classification Report:\n{report_df}")
+
+# ==============================================================================
+# 6. MAIN EXECUTION
+# ==============================================================================
+def main():
+    try:
+        if wandb.run is not None:
+            wandb.finish()
+    except Exception:
+        pass
+
+    config = ScriptConfig()
+    set_seed(config.seed)
+
+    config.output_dir.mkdir(exist_ok=True, parents=True)
+
+    is_wandb_enabled = False
+    try:
+        from google.colab import userdata
+        wand_api, HF_TOKEN = userdata.get('wand_api'), userdata.get('HF_TOKEN')
+        if wand_api: wandb.login(key=wand_api)
+        if HF_TOKEN: hf_login(token=HF_TOKEN)
+        is_wandb_enabled = True
+        os.environ["WANDB_MODE"] = "online"
+    except (ImportError, ModuleNotFoundError):
+        if os.getenv("wand_api"):
+            is_wandb_enabled = True
+            os.environ["WANDB_MODE"] = "online"
+
+    run_name = f"LORA-retrain-{Path(config.model_name_or_path).name}-{int(time.time())}"
+    if is_wandb_enabled:
+        wandb.init(project=config.project_name, config=vars(config), name=run_name)
+
+    tokenizer = AutoTokenizer.from_pretrained(config.model_name_or_path, use_fast=True)
+
+    train_ds, val_ds, test_ds, le, num_classes, class_weights = prepare_datasets(config, tokenizer)
+
+    # FIX: SIMPLIFIED & CORRECTED MODEL LOADING FOR LORA RETRAINING
+    logging.info(f"Loading base model: {config.model_name_or_path}")
+    base_model = AutoModelForSequenceClassification.from_pretrained(
+        config.model_name_or_path,
+        num_labels=num_classes,
+        attention_probs_dropout_prob=config.dropout,
+        hidden_dropout_prob=config.dropout,
+    )
+
+    logging.info(f"Loading and attaching LoRA adapter from: {config.lora_adapter_path}")
+    # Load the PeftModel by attaching the adapter to the base model.
+    # `is_trainable=True` ensures the adapter and classifier head are ready for training.
+    model = PeftModel.from_pretrained(base_model, config.lora_adapter_path, is_trainable=True)
+
+    # NEW: VERIFICATION STEP to confirm adapter is loaded correctly
+    # This utility prints a clear summary of trainable vs. total parameters.
+    # You should see a small percentage of trainable parameters (the LoRA layers + classifier).
+    logging.info("Verifying model parameter trainability...")
+    model.print_trainable_parameters()
+    # END OF FIX & VERIFICATION
+
+    training_args = TrainingArguments(
+        output_dir=str(config.output_dir / f"{run_name}_checkpoints"),
+        num_train_epochs=config.num_train_epochs,
+        per_device_train_batch_size=config.batch_size,
+        per_device_eval_batch_size=config.eval_batch_size,
+        gradient_accumulation_steps=config.gradient_accumulation_steps,
+        learning_rate=config.lr,
+        weight_decay=config.weight_decay,
+        adam_beta2=config.adam_beta2,
+        lr_scheduler_type=config.lr_scheduler_type,
+        warmup_ratio=config.warmup_ratio,
+        optim=config.optim,
+        fp16=True,
+        eval_strategy="steps", # Using eval_strategy as per your environment
+        eval_steps=config.eval_steps,
+        save_strategy="steps",
+        save_steps=config.save_steps,
+        save_total_limit=1,
+        load_best_model_at_end=True,
+        metric_for_best_model="macro_f1",
+        greater_is_better=True,
+        logging_steps=config.logging_steps,
+        report_to="wandb" if is_wandb_enabled else "none",
+        run_name=run_name,
+        dataloader_num_workers=config.num_workers,
+        dataloader_pin_memory=True,
+        seed=config.seed,
+        remove_unused_columns=False,
+    )
+
+    trainer = WeightedTrainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_ds,
+        eval_dataset=val_ds,
+        tokenizer=tokenizer,
+        compute_metrics=compute_metrics,
+        data_collator=DataCollatorWithPadding(tokenizer=tokenizer),
+        class_weights=class_weights,
+    )
+
+    logging.info("\n===== 🚀 Starting LoRA Re-Training =====\n")
+    trainer.train()
+
+    logging.info("\n===== ✅ Training Complete. Evaluating on Test Set... =====\n")
+    test_metrics = trainer.evaluate(eval_dataset=test_ds, metric_key_prefix="test")
+    print(f"Test Metrics: {test_metrics}")
+
+    if is_wandb_enabled:
+        wandb.log(test_metrics)
+        log_final_visualizations(trainer, test_ds, le, run_name)
+
+    del trainer, model; gc.collect(); torch.cuda.empty_cache()
+    if is_wandb_enabled:
+        wandb.finish()
+
+if __name__ == '__main__':
+    main()
