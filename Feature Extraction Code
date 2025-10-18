@@ -1,0 +1,496 @@
+
+
+
+
+
+
+
+# Stage 2 Embeddings
+
+import os
+import re
+import json
+from typing import List
+from collections import Counter
+import numpy as np
+import polars as pl
+from tqdm.auto import tqdm
+import time
+import sys
+
+# Import all necessary libraries for this standalone script
+import nltk
+try:
+    nltk.data.find('tokenizers/punkt')
+except LookupError:
+    print("Downloading NLTK 'punkt' model...")
+    nltk.download('punkt')
+
+from scipy.stats import entropy
+from scipy.spatial.distance import pdist
+import torch
+from sentence_transformers import SentenceTransformer, util
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
+from sklearn.neighbors import NearestNeighbors
+from textblob import TextBlob
+import textstat
+
+# --- OPTIMIZATION: Enable TF32 for Tensor Cores on T4 GPUs ---
+if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 7:
+    print("✅ Activating TF32 for T4 Tensor Cores")
+    torch.set_float32_matmul_precision('high')
+
+
+# --- 🚀 CONFIGURATION ---
+MODEL_CONFIG = { "embedding_model_name": "BAAI/bge-large-en-v1.5", "sentiment_model_name": "cardiffnlp/twitter-roberta-base-sentiment-latest" }
+FLAT_PARAMS = { "zipf_alpha": 1.3282553711605478, "epsilon": 7.087819402862414e-09, "context_gate_a": 5.229872486644787, "context_gate_b": 7.607865491868978, "confirmation_a": 9.878932493776453, "confirmation_b": -14.998685845493965, "authority_a": 7.176323444300493, "authority_b": -14.977480514043156, "negativity_a": 11.375746575449657, "negativity_b": 14.583403595350838, "anchoring_a": 8.125973275170615, "anchoring_b": -0.9065373130619498, "availability_a": 10.10333654162342, "availability_b": -5.370451203429246, "affect_a": 7.390188934735296, "affect_b": -6.148626158693156, "framing_a": -11.908187534986423, "framing_b": -3.7994724084814737, "ambiguity_a": -12.667356167009235, "ambiguity_b": 6.330885839342506, "popularity_a": 3.0484996783337017, "popularity_b": 0.24782080511658866, "semantic_novelty_a": -14.31978330001592, "semantic_novelty_b": 7.478760605144679, "sentiment_polarity_a": -14.750518757445196, "sentiment_polarity_b": 1.5423383424031472 }
+FEATURE_MAP = { "confirmation": "confirmation_score", "authority": "authority_score", "negativity": "negativity_score", "anchoring": "anchoring_score", "framing": "framing_score", "ambiguity": "ambiguity_score", "popularity": "popularity_score", "sentiment_polarity": "sentiment_polarity", "availability": "emotional_score", "affect": "emotional_score", "semantic_novelty": "external_semantic_novelty", "benford_divergence": "benford_divergence", "js_divergence": "js_divergence", "hapax_ratio": "hapax_ratio", "ttr": "ttr", "flesch_reading_ease": "flesch_reading_ease", "sentiment_logit_neg": "sentiment_logit_neg", "sentiment_logit_pos": "sentiment_logit_pos", "dislegomena_ratio": "dislegomena_ratio", "yules_k": "yules_k", "simpsons_index": "simpsons_index", "smog_index": "smog_index", "coleman_liau_index": "coleman_liau_index", "internal_semantic_coherence": "internal_semantic_coherence", "semantic_diversity": "semantic_diversity", "sentiment_subjectivity": "sentiment_subjectivity", "emotional_variation": "emotional_variation", "avg_knn_distance": "avg_knn_distance", }
+
+# --- HELPER FUNCTIONS ---
+def py_zipf_deviation(tokens: List[str]) -> float:
+    if not tokens: return 0.0
+    alpha = FLAT_PARAMS['zipf_alpha']; epsilon = FLAT_PARAMS['epsilon']
+    freqs = Counter(t for t in tokens if t.isalpha())
+    if not freqs: return 0.0
+    counts = np.array(sorted(freqs.values(), reverse=True))
+    if len(counts) == 0: return 0.0
+    ranks = np.arange(1, len(counts) + 1); expected_counts = counts[0] / (ranks ** alpha)
+    return float(np.sqrt(np.mean((np.log(counts + epsilon) - np.log(expected_counts + epsilon)) ** 2)))
+
+def run_gpu_pipeline():
+    print("--- 🚀 SCRIPT 2: Kicking off GPU & Finalization Stage ---")
+    CHECKPOINT_DIR = "/content/gpu_checkpoints"; os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+
+    # --- Stage 1: Load CPU features ---
+    cpu_features_dir = "cpu_features.parquet"
+    if not os.path.exists(cpu_features_dir):
+        print(f"❌ ERROR: `{cpu_features_dir}` not found. Please run Script 1 first."); return
+    print(f"✅ Loading data from Spark output directory '{cpu_features_dir}'...")
+    df = pl.read_parquet(f"{cpu_features_dir}/*.parquet")
+
+    # --- Stage 2: GPU Embeddings ---
+    checkpoint_2 = os.path.join(CHECKPOINT_DIR, "checkpoint_2_embeddings.npy")
+    if os.path.exists(checkpoint_2):
+        print("✅ Loading from final checkpoint '2_embeddings'...")
+        doc_embeddings = np.load(checkpoint_2)
+    else:
+        print("--- 🚀 Running stage: 2_embeddings (GPU) ---")
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        sbert_model = SentenceTransformer(MODEL_CONFIG['embedding_model_name'], device=device)
+        
+        texts_list = df["text"].to_list()
+        all_embeddings = []
+        start_index = 0
+        partial_results_file = os.path.join(CHECKPOINT_DIR, "embeddings_partial.npy")
+
+        if os.path.exists(partial_results_file):
+            print(f"✅ Found partial embedding results from '{partial_results_file}'. Resuming calculation...")
+            all_embeddings = list(np.load(partial_results_file, allow_pickle=True))
+            start_index = len(all_embeddings)
+            print(f"   Resuming from document {start_index}.")
+        
+        batch_size = 1024
+        total_items = len(texts_list)
+        save_interval = max(1, (total_items // batch_size) // 20) # Save every 5%
+        
+        pbar = tqdm(total=total_items, initial=start_index, desc="✨ Encoding Embeddings", unit=" docs")
+        
+        with torch.no_grad():
+            for i in range(start_index, total_items, batch_size):
+                batch = texts_list[i : i + batch_size]
+                
+                batch_embeddings = sbert_model.encode(
+                    batch, 
+                    show_progress_bar=False, 
+                    convert_to_numpy=True
+                )
+                all_embeddings.extend(batch_embeddings)
+                pbar.update(len(batch))
+
+                current_batch_idx = (i // batch_size)
+                if current_batch_idx > 0 and current_batch_idx % save_interval == 0:
+                    pbar.write(f"💾 Saving intermediate progress ({pbar.n}/{pbar.total})...")
+                    np.save(partial_results_file, np.array(all_embeddings))
+        
+        pbar.close()
+        doc_embeddings = np.array(all_embeddings)
+        if os.path.exists(partial_results_file):
+            os.remove(partial_results_file)
+        
+        print(f"💾 Saving final embeddings checkpoint to '{checkpoint_2}'..."); np.save(checkpoint_2, doc_embeddings)
+
+    # --- Stage 3: GPU Sentiment Logits ---
+    checkpoint_3 = os.path.join(CHECKPOINT_DIR, "checkpoint_3_logits.parquet")
+    if os.path.exists(checkpoint_3):
+        print("✅ Loading from checkpoint '3_logits'...")
+        df = pl.read_parquet(checkpoint_3)
+    else:
+        print("--- 🚀 Running stage: 3_logits (GPU) ---")
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        sentiment_tokenizer = AutoTokenizer.from_pretrained(MODEL_CONFIG['sentiment_model_name'])
+        sentiment_model = AutoModelForSequenceClassification.from_pretrained(MODEL_CONFIG['sentiment_model_name']).to(device).eval()
+
+        texts_list = df["text"].to_list()
+        all_logits = []
+        start_index = 0
+        partial_results_file = os.path.join(CHECKPOINT_DIR, "logits_partial.npy")
+        if os.path.exists(partial_results_file):
+            print(f"✅ Found partial logit results from '{partial_results_file}'. Resuming calculation...")
+            all_logits = list(np.load(partial_results_file, allow_pickle=True))
+            start_index = len(all_logits)
+            print(f"   Resuming from document {start_index}.")
+
+        batch_size = 1024
+        total_items = len(texts_list)
+        save_interval = max(1, (total_items // batch_size) // 20) # Save every 5%
+
+        pbar = tqdm(total=total_items, initial=start_index, desc="📈 Calculating Logits", unit=" docs")
+
+        with torch.no_grad():
+            for i in range(start_index, total_items, batch_size):
+                batch = texts_list[i:i+batch_size]
+                inputs = sentiment_tokenizer(batch, return_tensors="pt", padding=True, truncation=True, max_length=512).to(device)
+                logits = sentiment_model(**inputs).logits.cpu().numpy()
+                all_logits.extend(logits)
+                pbar.update(len(batch))
+
+                current_batch_idx = (i // batch_size)
+                if current_batch_idx > 0 and current_batch_idx % save_interval == 0:
+                    pbar.write(f"💾 Saving intermediate logit progress ({pbar.n}/{pbar.total})...")
+                    np.save(partial_results_file, np.array(all_logits))
+        
+        pbar.close()
+        all_logits_np = np.array(all_logits)
+        df = df.with_columns(
+            pl.Series("sentiment_logit_neg", all_logits_np[:, 0]),
+            pl.Series("sentiment_logit_neu", all_logits_np[:, 1]),
+            pl.Series("sentiment_logit_pos", all_logits_np[:, 2])
+        )
+        if os.path.exists(partial_results_file):
+            os.remove(partial_results_file)
+        print(f"💾 Saving checkpoint for '3_logits'..."); df.write_parquet(checkpoint_3)
+
+    # --- The rest of the script remains unchanged ---
+    print("\n--- 🚀 Running Final Global & Semantic Features ---")
+    if "zipf_deviation" not in df.columns: df = df.with_columns(pl.Series("zipf_deviation", [py_zipf_deviation(tokens) for tokens in tqdm(df["tokens"].to_list(), desc="Zipf Deviation")]))
+    if "external_semantic_novelty" not in df.columns:
+        centroid = np.mean(doc_embeddings, axis=0).reshape(1, -1); distances_from_centroid = np.diag(util.pytorch_cos_sim(torch.from_numpy(doc_embeddings), torch.from_numpy(centroid))); df = df.with_columns(pl.Series("external_semantic_novelty", 1.0 - (1.0 - distances_from_centroid)**2))
+    if "avg_knn_distance" not in df.columns:
+        print("  - Building k-NN model..."); k = 5; nn_model = NearestNeighbors(n_neighbors=k + 1, metric='cosine').fit(doc_embeddings); distances, _ = nn_model.kneighbors(doc_embeddings); df = df.with_columns(pl.Series("avg_knn_distance", distances[:, 1:].mean(axis=1)))
+    if "emotional_variation" not in df.columns:
+        print("  - Calculating semantic variation..."); sbert_model = SentenceTransformer(MODEL_CONFIG['embedding_model_name'], device="cuda" if torch.cuda.is_available() else "cpu"); texts_list = df["text"].to_list(); sentences_list = [nltk.sent_tokenize(text) for text in tqdm(texts_list, desc="Sentence Tokenizing")]; emotional_variations, internal_coherences, semantic_diversities = [], [], []
+        for doc_sentences in tqdm(sentences_list, desc="Semantic/Emotional Variation"):
+            if len(doc_sentences) < 2: emotional_variations.append(0.0); internal_coherences.append(1.0); semantic_diversities.append(0.0); continue
+            emo_var = np.std([TextBlob(s).sentiment.polarity for s in doc_sentences]); half = len(doc_sentences) // 2; part1, part2 = " ".join(doc_sentences[:half]), " ".join(doc_sentences[half:]); half_embs = sbert_model.encode([part1, part2], convert_to_tensor=True, show_progress_bar=False); int_coh = util.pytorch_cos_sim(half_embs[0], half_embs[1]).item(); sent_embs = sbert_model.encode(doc_sentences, convert_to_tensor=True, show_progress_bar=False); sem_div = np.mean(pdist(sent_embs.cpu().numpy(), metric='cosine')) if sent_embs.shape[0] > 1 else 0.0; emotional_variations.append(float(emo_var)); internal_coherences.append(float(int_coh)); semantic_diversities.append(float(sem_div))
+        df = df.with_columns(pl.Series("emotional_variation", emotional_variations), pl.Series("internal_semantic_coherence", internal_coherences), pl.Series("semantic_diversity", semantic_diversities))
+    
+    print("\n--- 🏁 Applying Final Transformations ---"); final_params_nested = {key: FLAT_PARAMS.get(key) for key in ["zipf_alpha", "epsilon", "context_gate_a", "context_gate_b"]}; final_params_nested["logistic_map"] = {};
+    for name in FEATURE_MAP.keys(): final_params_nested["logistic_map"][name] = {"a": FLAT_PARAMS.get(f"{name}_a", 0), "b": FLAT_PARAMS.get(f"{name}_b", 0)}
+    df_final = df; epsilon = final_params_nested['epsilon']
+    for name in ["authority", "negativity", "anchoring", "confirmation", "emotional", "ambiguity", "popularity"]: df_final = df_final.with_columns((pl.col(f"{name}_raw") / (pl.col("word_count") + epsilon)).alias(f"{name}_score"))
+    gate_a, gate_b = final_params_nested['context_gate_a'], final_params_nested['context_gate_b']; gate_expr = 1 / (1 + (-(gate_a * pl.col("authority_score") + gate_b * pl.col("external_semantic_novelty"))).exp()); df_final = df_final.with_columns((pl.col("emotional_score") * gate_expr).alias("context_gated_emotional_score"))
+    for name, p in final_params_nested["logistic_map"].items():
+        col_name = FEATURE_MAP.get(name)
+        if col_name and col_name in df_final.columns:
+            a, b = p.get('a', 0), p.get('b', 0); df_final = df_final.with_columns((1 / (1 + (-(pl.col(col_name) * a + b)).exp())).alias(f"{col_name}_transformed"))
+    cols_to_drop = ["tokens"] + [c for c in df_final.columns if c.endswith("_raw")]; df_final = df_final.drop(columns=cols_to_drop)
+    
+    output_parquet, output_csv = "final_features.parquet", "final_features.csv"; print(f"💾 Saving final results to Parquet: '{output_parquet}'..."); df_final.write_parquet(output_parquet); print(f"💾 Saving final results to CSV: '{output_csv}'..."); df_final.write_csv(output_csv)
+    print("\n--- 🎉 SCRIPT 2: Analysis Complete! ---"); print("Final DataFrame sample:"); print(df_final.head())
+
+
+# --- SCRIPT ENTRY POINT ---
+if __name__ == "__main__":
+    run_gpu_pipeline()
+
+
+
+
+
+
+# Stage 4
+
+import os
+import re
+import json
+from typing import List
+from collections import Counter
+import numpy as np
+import polars as pl
+from tqdm.auto import tqdm
+import time
+import sys
+from multiprocessing import Pool
+
+# Import all necessary libraries for this standalone script
+import nltk
+try:
+    nltk.data.find('tokenizers/punkt')
+except LookupError:
+    print("Downloading NLTK 'punkt' model...")
+    nltk.download('punkt')
+try:
+    nltk.data.find('vader_lexicon')
+except LookupError:
+    print("Downloading NLTK 'vader_lexicon' model...")
+    nltk.download('vader_lexicon')
+
+from scipy.stats import entropy
+from scipy.spatial.distance import pdist
+import torch
+from sentence_transformers import SentenceTransformer, util
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
+from sklearn.neighbors import NearestNeighbors
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+import textstat
+
+# --- 🚀 CONFIGURATION ---
+MODEL_CONFIG = { "embedding_model_name": "BAAI/bge-large-en-v1.5",
+                 "sentiment_model_name": "cardiffnlp/twitter-roberta-base-sentiment-latest" }
+FLAT_PARAMS = { "zipf_alpha": 1.3282553711605478, "epsilon": 7.087819402862414e-09, "context_gate_a": 5.229872486644787, "context_gate_b": 7.607865491868978, "confirmation_a": 9.878932493776453, "confirmation_b": -14.998685845493965, "authority_a": 7.176323444300493, "authority_b": -14.977480514043156, "negativity_a": 11.375746575449657, "negativity_b": 14.583403595350838, "anchoring_a": 8.125973275170615, "anchoring_b": -0.9065373130619498, "availability_a": 10.10333654162342, "availability_b": -5.370451203429246, "affect_a": 7.390188934735296, "affect_b": -6.148626158693156, "framing_a": -11.908187534986423, "framing_b": -3.7994724084814737, "ambiguity_a": -12.667356167009235, "ambiguity_b": 6.330885839342506, "popularity_a": 3.0484996783337017, "popularity_b": 0.24782080511658866, "semantic_novelty_a": -14.3197830001592, "semantic_novelty_b": 7.478760605144679, "sentiment_polarity_a": -14.750518757445196, "sentiment_polarity_b": 1.5423383424031472 }
+FEATURE_MAP = { "confirmation": "confirmation_score", "authority": "authority_score", "negativity": "negativity_score", "anchoring": "anchoring_score", "framing": "framing_score", "ambiguity": "ambiguity_score", "popularity": "popularity_score", "sentiment_polarity": "sentiment_polarity", "availability": "emotional_score", "affect": "emotional_score", "semantic_novelty": "external_semantic_novelty", "benford_divergence": "benford_divergence", "js_divergence": "js_divergence", "hapax_ratio": "hapax_ratio", "ttr": "ttr", "flesch_reading_ease": "flesch_reading_ease", "sentiment_logit_neg": "sentiment_logit_neg", "sentiment_logit_pos": "sentiment_logit_pos", "dislegomena_ratio": "dislegomena_ratio", "yules_k": "yules_k", "simpsons_index": "simpsons_index", "smog_index": "smog_index", "coleman_liau_index": "coleman_liau_index", "internal_semantic_coherence": "internal_semantic_coherence", "semantic_diversity": "semantic_diversity", "sentiment_subjectivity": "sentiment_subjectivity", "emotional_variation": "emotional_variation", "avg_knn_distance": "avg_knn_distance", }
+
+# --- HELPER FUNCTIONS ---
+_vader_analyzer = None
+def init_vader():
+    global _vader_analyzer
+    _vader_analyzer = SentimentIntensityAnalyzer()
+
+def process_text_for_semantic_features(text: str):
+    sentences = nltk.sent_tokenize(text)
+    if len(sentences) < 2:
+        return sentences, 0.0
+    sentiments = [_vader_analyzer.polarity_scores(s)['compound'] for s in sentences]
+    return sentences, np.std(sentiments)
+
+def run_gpu_pipeline():
+    print("--- 🚀 SCRIPT 2: Kicking off GPU & Finalization Stage ---")
+    CHECKPOINT_DIR = "./gpu_checkpoints"; os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+
+    # --- Stage 1 & 2 & 3: Load completed checkpoints ---
+    cpu_features_dir = "cpu_features.parquet"
+    df = pl.read_parquet(f"{cpu_features_dir}/*.parquet")
+    if "id" not in df.columns: df = df.with_row_index("id")
+
+    checkpoint_2 = os.path.join(CHECKPOINT_DIR, "checkpoint_2_embeddings.npy")
+    print("✅ Loading from checkpoint '2_embeddings'...")
+    doc_embeddings = np.load(checkpoint_2)
+
+    checkpoint_3 = os.path.join(CHECKPOINT_DIR, "checkpoint_3_logits.parquet")
+    print("✅ Loading from checkpoint '3_logits'...")
+    df = pl.read_parquet(checkpoint_3)
+
+    print("\n--- 🚀 Running Final Global & Semantic Features ---")
+    # These fast features will be skipped if columns already exist
+    if "zipf_deviation" not in df.columns: df = df.with_columns(pl.Series("zipf_deviation", [py_zipf_deviation(tokens) for tokens in tqdm(df["tokens"].to_list(), desc="Zipf Deviation")]))
+    if "external_semantic_novelty" not in df.columns:
+        print("   - Calculating external semantic novelty...")
+        centroid = np.mean(doc_embeddings, axis=0)
+        similarities = util.cos_sim(doc_embeddings, centroid).numpy().flatten()
+        df = df.with_columns(pl.Series("external_semantic_novelty", 1.0 - (1.0 - similarities)**2))
+    if "avg_knn_distance" not in df.columns:
+        print("   - Building k-NN model..."); k = 5; nn_model = NearestNeighbors(n_neighbors=k + 1, metric='cosine').fit(doc_embeddings); distances, _ = nn_model.kneighbors(doc_embeddings); df = df.with_columns(pl.Series("avg_knn_distance", distances[:, 1:].mean(axis=1)))
+
+    # --- 🚀 ROBUST & OPTIMIZED SEMANTIC/EMOTIONAL CALCULATION (STEP 4) ---
+    if "emotional_variation" not in df.columns:
+        print("   - Calculating semantic/emotional variation (Robust Resume Mode)...")
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+        checkpoint_4 = os.path.join(CHECKPOINT_DIR, "checkpoint_4_semantic_features.parquet")
+        final_results_df_list = []
+        start_doc_idx = 0
+
+        # --- INTELLIGENT RESUME LOGIC ---
+        if os.path.exists(checkpoint_4):
+            print(f"✅ Found semantic checkpoint. Loading partial results...")
+            partial_df = pl.read_parquet(checkpoint_4)
+            if partial_df.height < df.height:
+                final_results_df_list.append(partial_df)
+                start_doc_idx = partial_df.height
+                print(f"   ⚠️ Checkpoint is incomplete. Resuming from document index {start_doc_idx}.")
+            else:
+                print("   ✅ Checkpoint is complete. Skipping to merge.")
+                final_semantic_df = partial_df
+
+        if start_doc_idx < df.height:
+            print("   - Loading high-quality model (bge-large) for sentence encoding...")
+            sbert_model = SentenceTransformer(MODEL_CONFIG['embedding_model_name'], device=device)
+            doc_ids = df["id"].to_list()
+            texts_list = df["text"].to_list()
+            total_docs = len(texts_list)
+            chunk_size = max(1, total_docs // 10)
+
+            for i in range(start_doc_idx, total_docs, chunk_size):
+                end_idx = min(i + chunk_size, total_docs)
+                chunk_num = (i // chunk_size) + 1
+                num_chunks = ((total_docs - start_doc_idx) + chunk_size - 1) // chunk_size
+                print(f"\n--- 🔄 Processing Chunk {chunk_num}/{num_chunks} (Resumed) ---")
+
+                chunk_texts = texts_list[i:end_idx]
+                chunk_doc_ids = doc_ids[i:end_idx]
+
+                with Pool(initializer=init_vader) as pool:
+                    results = list(tqdm(pool.imap(process_text_for_semantic_features, chunk_texts, chunksize=100), total=len(chunk_texts), desc="CPU Tasks"))
+
+                chunk_sentences_list, chunk_emotional_variations = zip(*results)
+
+                flat_sentences = [sent for doc in chunk_sentences_list for sent in doc]
+
+                print("   - Encoding all sentences in chunk (this will take a while)...")
+                all_sent_embs = sbert_model.encode(
+                    flat_sentences, batch_size=256, show_progress_bar=True, convert_to_tensor=True
+                )
+
+                internal_coherences, semantic_diversities = [], []
+                current_pos = 0
+                for doc_sentences in tqdm(chunk_sentences_list, desc="Coherence/Diversity"):
+                    num_sents = len(doc_sentences)
+                    if num_sents < 2:
+                        internal_coherences.append(1.0); semantic_diversities.append(0.0)
+                        continue
+
+                    doc_embs = all_sent_embs[current_pos : current_pos + num_sents]
+                    current_pos += num_sents
+                    half = num_sents // 2
+                    emb_part1 = torch.mean(doc_embs[:half], dim=0)
+                    emb_part2 = torch.mean(doc_embs[half:], dim=0)
+                    internal_coherences.append(util.pytorch_cos_sim(emb_part1, emb_part2).item())
+                    sem_div = np.mean(pdist(doc_embs.cpu().numpy(), metric='cosine')) if doc_embs.shape[0] > 1 else 0.0
+                    semantic_diversities.append(sem_div)
+
+                chunk_results_df = pl.DataFrame({
+                    "id": chunk_doc_ids,
+                    "emotional_variation": chunk_emotional_variations,
+                    "internal_semantic_coherence": internal_coherences,
+                    "semantic_diversity": semantic_diversities
+                })
+                final_results_df_list.append(chunk_results_df)
+
+                print(f"   💾 Saving checkpoint for chunk {chunk_num}...")
+                final_semantic_df = pl.concat(final_results_df_list)
+                final_semantic_df.write_parquet(checkpoint_4)
+
+        print("\n--- ✨ Merging all semantic features with main DataFrame ---")
+        df = df.join(final_semantic_df, on="id", how="left")
+
+    # --- 🏁 Applying Final Transformations ---
+    print("\n--- 🏁 Applying Final Transformations ---")
+    df_final = df
+    epsilon = FLAT_PARAMS['epsilon']
+    for name in ["authority", "negativity", "anchoring", "confirmation", "emotional", "ambiguity", "popularity"]:
+      if f"{name}_raw" in df_final.columns:
+        df_final = df_final.with_columns((pl.col(f"{name}_raw") / (pl.col("word_count") + epsilon)).alias(f"{name}_score"))
+
+    gate_a, gate_b = FLAT_PARAMS['context_gate_a'], FLAT_PARAMS['context_gate_b']
+    gate_expr = 1 / (1 + (-(pl.col("authority_score") * gate_a + pl.col("external_semantic_novelty") * gate_b)).exp())
+    df_final = df_final.with_columns((pl.col("emotional_score") * gate_expr).alias("context_gated_emotional_score"))
+
+    for name, p in FLAT_PARAMS.items():
+        if name.endswith("_a"):
+            feature = name[:-2]
+            col_name = FEATURE_MAP.get(feature)
+            if col_name and col_name in df_final.columns:
+                a = FLAT_PARAMS[f"{feature}_a"]
+                b = FLAT_PARAMS[f"{feature}_b"]
+                df_final = df_final.with_columns((1 / (1 + (-(pl.col(col_name) * a + b)).exp())).alias(f"{col_name}_transformed"))
+
+    cols_to_drop = ["tokens", "id"] + [c for c in df_final.columns if c.endswith("_raw")]
+    if 'text' in df_final.columns:
+        cols_to_drop.append('text') # Assuming 'text' is dropped at the end
+    df_final = df_final.drop([col for col in cols_to_drop if col in df_final.columns])
+
+    output_parquet, output_csv = "final_features.parquet", "final_features.csv"
+    print(f"💾 Saving final results to Parquet: '{output_parquet}'...")
+    df_final.write_parquet(output_parquet)
+    print(f"💾 Saving final results to CSV: '{output_csv}'...")
+    df_final.write_csv(output_csv)
+    print("\n--- 🎉 SCRIPT 2: Analysis Complete! ---")
+    print("Final DataFrame sample:")
+    print(df_final.head())
+
+if __name__ == "__main__":
+    run_gpu_pipeline()
+
+# Stage 5
+
+import polars as pl
+import os
+
+# --- 1. Define File Paths ---
+# The script will read these files, then overwrite them.
+features_csv = "final_features.csv"
+features_parquet = "final_features.parquet"
+labels_file = "news_df.csv"
+
+print(f"Loading features from '{features_parquet}'...")
+# We use the Parquet file as the source for speed and accurate data types
+features_df = pl.read_parquet(features_parquet)
+
+# --- 2. Load and Prepare Labels ---
+if os.path.exists(labels_file):
+    print(f"Loading labels from '{labels_file}'...")
+    labels_df = pl.read_csv(labels_file)
+
+    # --- Find the correct label column ---
+    possible_label_cols = ['label', 'labels', 'Label', 'Labels', 'LABEL']
+    label_col_name = None
+    for col in possible_label_cols:
+        if col in labels_df.columns:
+            label_col_name = col
+            print(f"✅ Found label column: '{label_col_name}'")
+            break
+
+    if label_col_name:
+        # Keep only 'title' and the found label column
+        labels_df = labels_df.select(["title", label_col_name])
+
+        # Drop the existing (null) 'label' column to prevent a collision
+        if 'label' in features_df.columns:
+            print("Dropping existing 'label' column...")
+            features_df = features_df.drop('label')
+
+        # --- 3. Perform an INNER JOIN to add correct labels ---
+        print("Joining datasets...")
+        final_df = features_df.join(labels_df, on="title", how="inner")
+
+        # Rename the new label column to the standard 'label'
+        if label_col_name != 'label':
+            final_df = final_df.rename({label_col_name: 'label'})
+
+        # --- 4. Create document_id and Drop Unwanted Columns ---
+        print("Creating 'document_id' and dropping 'title' and 'text' columns...")
+        final_df = final_df.with_row_index("document_id")
+
+        columns_to_drop = []
+        if "title" in final_df.columns:
+            columns_to_drop.append("title")
+        if "text" in final_df.columns:
+            columns_to_drop.append("text")
+
+        if columns_to_drop:
+            final_df = final_df.drop(columns_to_drop)
+
+        # --- 5. Reorder Columns ---
+        all_cols = final_df.columns
+        cols_to_front = ["document_id", "label"]
+        other_cols = [c for c in all_cols if c not in cols_to_front]
+        final_col_order = cols_to_front + other_cols
+        final_df = final_df.select(final_col_order)
+
+        # --- 6. Overwrite Original Files ---
+        print(f"💾 Overwriting '{features_parquet}' with updated data...")
+        final_df.write_parquet(features_parquet)
+
+        print(f"💾 Overwriting '{features_csv}' with updated data...")
+        final_df.write_csv(features_csv)
+
+        print("\n--- ✅ Final feature files have been updated successfully! ---")
+        print("Sample of the updated data:")
+        print(final_df.head())
+        print(f"\nUpdated dataset shape: {final_df.shape}")
+
+    else:
+        print(f"❌ Error: Could not find a label column in '{labels_file}'.")
+
+else:
+    print(f"❌ Error: Label file '{labels_file}' not found. Cannot proceed.")
