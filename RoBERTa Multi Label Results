@@ -1,4 +1,9 @@
 
+Evaluation Metrics on Test Dataset
+Dataset:
+ - 6 way label
+ - 
+
 Step	         7500
 Training Loss      0.428600
 Validation Loss    0.411746	  
