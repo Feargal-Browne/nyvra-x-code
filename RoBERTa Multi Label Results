@@ -2,12 +2,13 @@
 Evaluation Metrics on Test Dataset
 Dataset:
  - 6 way label
-  - 
-  -
-  -
-  -
-  -
-  -
+  - 0: "True",
+    1: "Manipulated Content",
+    2: "Satire/Parody",
+    3: "Imposter Content",
+    4: "Misleading Content",
+    5: "False Connection" 
+
  - Citation
 
 @article{nakamura2019r,
@@ -17,11 +18,11 @@ Dataset:
     year={2019}
 }
 
-Step	         7500
+Step	              7500
 Training Loss      0.428600
 Validation Loss    0.411746	  
-Accuracy	         0.835924
-Macro F1	         0.811398
+Accuracy	          0.835924
+Macro F1	          0.811398
 Brier Score        0.038898
 Pr Auc Macro       0.905520
 F1 Class 0         0.891238
