@@ -1,0 +1,408 @@
+# --- 1. Install Dependencies ---
+!pip install -q torch_geometric transformers peft accelerate scikit-learn pandas faiss-cpu tqdm pennylane "pennylane-lightning"
+
+# --- 2. Import Libraries ---
+import os
+import gc
+import json
+import logging
+import numpy as np
+import pandas as pd
+import faiss
+from tqdm.auto import tqdm
+from google.colab import userdata
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, roc_auc_score
+from sklearn.svm import SVC
+from sklearn.preprocessing import StandardScaler
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from torch.utils.checkpoint import checkpoint
+
+from transformers import AutoTokenizer, AutoModel
+from peft import PeftConfig, PeftModel
+
+from torch_geometric.nn import TransformerConv
+
+import pennylane as qml
+
+# --- 3. Centralized Configuration ---
+class CFG:
+    """Configuration class for all model and training parameters."""
+    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+    CHECKPOINT_DIR = "/content/checkpoints"
+    # Paths for individual checkpoint files for resumability
+    STATE_FILE_PATH = os.path.join(CHECKPOINT_DIR, "training_state.json")
+    MODEL_STATE_PATH = os.path.join(CHECKPOINT_DIR, "model_state.pt")
+    OPTIMIZER_STATE_PATH = os.path.join(CHECKPOINT_DIR, "optimizer.pt")
+    SCHEDULER_STATE_PATH = os.path.join(CHECKPOINT_DIR, "scheduler.pt")
+    # Path for the final best model for inference
+    BEST_MODEL_PATH = os.path.join(CHECKPOINT_DIR, "best_model.pt")
+    LOG_FILE = "training.log"
+    SEED = 42
+    DATA_PATH = "/content/Final_Preprocessed_Data.csv"
+    TEXT_COL = "tweet"
+    TARGET_COL = "BinaryNumTarget"
+    TIMESTAMP_COL = "timestamp"
+    FEATURE_COLS = [
+        'followers_count', 'friends_count', 'favourites_count', 'statuses_count',
+        'listed_count', 'mentions', 'quotes', 'retweets', 'hashtags', 'URLs'
+    ]
+    MAX_LEN = 256
+    KNN_K = 10
+    BASE_MODEL = "roberta-base"
+    LORA_ADAPTER = "Feargal/roberta-lora-disinformation-final"
+    D_MODEL = 768
+    GT_HIDDEN_DIM = 128
+    GT_N_HEADS = 4
+    GT_N_LAYERS = 3
+    TIME_ENC_DIM = 128
+    QUANTUM_FEATURE_DIM = 64
+    N_QUBITS = 5
+    EPOCHS = 5
+    BATCH_SIZE = 3
+    LEARNING_RATE = 2e-5
+    WEIGHT_DECAY = 1e-2
+    GRAD_CLIP_NORM = 1.0
+    USE_GRADIENT_CHECKPOINTING = False
+    NUM_WORKERS = 2
+
+# --- 4. Setup Environment ---
+os.makedirs(CFG.CHECKPOINT_DIR, exist_ok=True)
+torch.manual_seed(CFG.SEED)
+np.random.seed(CFG.SEED)
+torch.backends.cudnn.benchmark = True
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', filename=CFG.LOG_FILE, filemode='a')
+console = logging.StreamHandler(); console.setLevel(logging.INFO)
+logging.getLogger('').addHandler(console)
+
+try:
+    from huggingface_hub import login
+    login(token=userdata.get('HF_TOKEN'))
+    logging.info("✅ Successfully logged into Hugging Face.")
+except (userdata.SecretNotFoundError, ImportError):
+    logging.warning("⚠️ Hugging Face token not found. Proceeding without login.")
+
+# --- 5. Quantum Kernel Processor (Unchanged) ---
+class QuantumKernelProcessor:
+    def __init__(self):
+        self.device = qml.device("lightning.qubit", wires=CFG.N_QUBITS)
+        self.kernel_circuit = self._create_kernel_circuit()
+        logging.info(f"✅ Quantum Kernel Processor initialized with device: {self.device.name}")
+    def _zz_feature_map(self, x):
+        for i in range(CFG.N_QUBITS): qml.Hadamard(wires=i); qml.RZ(2.0 * x[i % len(x)], wires=i)
+        for i in range(CFG.N_QUBITS - 1):
+            qml.CNOT(wires=[i, i + 1])
+            qml.RZ(2.0 * (np.pi - x[i % len(x)]) * (np.pi - x[(i + 1) % len(x)]), wires=i + 1)
+            qml.CNOT(wires=[i, i + 1])
+    def _create_kernel_circuit(self):
+        @qml.qnode(self.device, interface="torch", diff_method=None)
+        def circuit(x1, x2):
+            self._zz_feature_map(x1); qml.adjoint(self._zz_feature_map)(x2)
+            return qml.probs(wires=range(CFG.N_QUBITS))
+        return circuit
+    def calculate_kernel_matrix(self, X1, X2=None):
+        logging.info(f"Calculating kernel matrix for X1 shape {X1.shape} and X2 shape {X2.shape if X2 is not None else 'N/A'}...")
+        X1_torch = torch.from_numpy(X1).to(torch.float32)
+        X2_torch = None if X2 is None else torch.from_numpy(X2).to(torch.float32)
+        kernel_matrix = qml.kernels.kernel_matrix(X1_torch, X2_torch, self.kernel_circuit)[:, :, 0]
+        return kernel_matrix.cpu().numpy()
+
+# --- 6. Data Pipeline and Model Definitions ---
+class DisinformationDataset(Dataset):
+    def __init__(self, texts, prop_features, labels, indices, timestamps):
+        self.texts, self.prop_features, self.labels, self.indices, self.timestamps = texts, prop_features, labels, indices, timestamps
+    def __len__(self): return len(self.texts)
+    def __getitem__(self, i):
+        return {"text": self.texts[i], "prop_features": self.prop_features[i], "label": self.labels[i], "idx": self.indices[i], "t": self.timestamps[i]}
+
+def create_collate_fn(tokenizer):
+    def collate_fn(batch):
+        texts = [item['text'] for item in batch]
+        indices = [item['idx'] for item in batch]
+        prop_features = torch.stack([item['prop_features'] for item in batch])
+        labels = torch.tensor([item['label'] for item in batch], dtype=torch.long)
+        timestamps = torch.tensor([item['t'] for item in batch], dtype=torch.float)
+        tok = tokenizer(texts, padding="max_length", truncation=True, max_length=CFG.MAX_LEN, return_tensors="pt")
+        return {"input_ids": tok["input_ids"], "attention_mask": tok["attention_mask"], "prop_features": prop_features, "labels": labels, "indices": torch.tensor(indices), "t": timestamps}
+    return collate_fn
+
+def load_roberta_with_lora():
+    try:
+        config = PeftConfig.from_pretrained(CFG.LORA_ADAPTER)
+        base_model = AutoModel.from_pretrained(config.base_model_name_or_path)
+        model = PeftModel.from_pretrained(base_model, CFG.LORA_ADAPTER)
+        model = model.merge_and_unload()
+        logging.info("✅ LoRA adapters merged successfully.")
+    except Exception as e:
+        logging.warning(f"⚠️ Could not load LoRA adapter. Error: {e}. Using base model.")
+        model = AutoModel.from_pretrained(CFG.BASE_MODEL)
+    return model
+
+class TimeEncoder(nn.Module):
+    def __init__(self, dimension):
+        super().__init__()
+        self.w = nn.Linear(1, dimension)
+        self.w.weight = nn.Parameter(torch.from_numpy(1 / 10 ** np.linspace(0, 9, dimension)).float().reshape(dimension, -1))
+        self.w.bias = nn.Parameter(torch.zeros(dimension).float())
+    def forward(self, t): return torch.cos(self.w(t.unsqueeze(dim=1)))
+
+class GraphTransformerModel(nn.Module):
+    def __init__(self, in_dim, model_dim, num_heads, num_layers, num_nodes, time_dim):
+        super().__init__()
+        self.pos_embedding = nn.Embedding(num_embeddings=num_nodes, embedding_dim=model_dim)
+        self.time_encoder = TimeEncoder(time_dim)
+        self.input_proj = nn.Linear(in_dim + model_dim + time_dim, model_dim)
+        self.transformer_layers = nn.ModuleList([
+            TransformerConv(in_channels=model_dim, out_channels=model_dim // num_heads, heads=num_heads, dropout=0.1)
+            for _ in range(num_layers)
+        ])
+        self.norm_layers = nn.ModuleList([nn.LayerNorm(model_dim) for _ in range(num_layers)])
+        self.proj = nn.Linear(model_dim, CFG.QUANTUM_FEATURE_DIM)
+    def forward(self, x, t, edge_index, node_indices):
+        pos_emb = self.pos_embedding(node_indices); time_emb = self.time_encoder(t)
+        combined_emb = torch.cat([x, pos_emb, time_emb], dim=1)
+        x = self.input_proj(combined_emb)
+        for i, layer in enumerate(self.transformer_layers):
+            x = self.norm_layers[i](x + layer(x, edge_index))
+        return self.proj(x)
+
+class HybridDisinformationDetector(nn.Module):
+    def __init__(self, roberta_model, num_prop_features, num_nodes, num_classes):
+        super().__init__()
+        self.roberta = roberta_model
+        for param in self.roberta.parameters(): param.requires_grad = False
+        for param in self.roberta.encoder.layer[-4:].parameters(): param.requires_grad = True
+        self.feature_proj = nn.Linear(CFG.D_MODEL + num_prop_features, CFG.GT_HIDDEN_DIM)
+        self.graph_transformer = GraphTransformerModel(in_dim=CFG.GT_HIDDEN_DIM, model_dim=CFG.GT_HIDDEN_DIM, num_heads=CFG.GT_N_HEADS, num_layers=CFG.GT_N_LAYERS, num_nodes=num_nodes, time_dim=CFG.TIME_ENC_DIM)
+        self.classifier = nn.Linear(CFG.QUANTUM_FEATURE_DIM, num_classes)
+    def forward(self, input_ids, attention_mask, prop_features, t, edge_index, node_indices, return_embeddings=False):
+        def roberta_forward(ii, am): return self.roberta(input_ids=ii, attention_mask=am).last_hidden_state[:, 0, :]
+        doc_repr = checkpoint(roberta_forward, input_ids, attention_mask, use_reentrant=False) if CFG.USE_GRADIENT_CHECKPOINTING else roberta_forward(input_ids, attention_mask)
+        combined_features = torch.cat([doc_repr, prop_features], dim=1)
+        projected_features = F.relu(self.feature_proj(combined_features))
+        embeddings = self.graph_transformer(projected_features, t, edge_index, node_indices)
+        return embeddings if return_embeddings else self.classifier(embeddings)
+
+# --- 7. Full-Featured Trainer Class ---
+class Trainer:
+    def __init__(self, model, dataloaders):
+        self.model = model.to(CFG.DEVICE)
+        self.dataloaders = dataloaders
+        self.optimizer = torch.optim.AdamW(model.parameters(), lr=CFG.LEARNING_RATE, weight_decay=CFG.WEIGHT_DECAY)
+        self.scheduler = torch.optim.lr_scheduler.OneCycleLR(self.optimizer, max_lr=CFG.LEARNING_RATE, steps_per_epoch=len(dataloaders['train']), epochs=CFG.EPOCHS)
+        self.criterion = nn.CrossEntropyLoss()
+        self.scaler = torch.amp.GradScaler('cuda', enabled=(CFG.DEVICE == 'cuda'))
+        self.qke = QuantumKernelProcessor()
+        self.best_val_f1 = -1.0
+        self.start_epoch = 0
+
+        self.load_checkpoint() # Attempt to load a checkpoint on initialization
+
+    def _create_batch_graph(self, prop_features_gpu):
+        B = prop_features_gpu.size(0)
+        k = min(CFG.KNN_K, B - 1)
+        if k <= 0: return torch.empty((2, 0), dtype=torch.long, device=CFG.DEVICE)
+        prop_features_cpu = prop_features_gpu.cpu().numpy()
+        index = faiss.IndexFlatL2(prop_features_cpu.shape[1])
+        index.add(prop_features_cpu)
+        _, neighbors = index.search(prop_features_cpu, k + 1)
+        neighbors = neighbors[:, 1:]
+        source = torch.arange(B).view(-1, 1).expand(-1, k).flatten()
+        target = torch.from_numpy(neighbors).flatten()
+        return torch.stack([source, target], dim=0).to(CFG.DEVICE)
+
+    def save_checkpoint(self, epoch, is_best):
+        """Saves the complete training state into separate files for resumability."""
+        # Save training state (epoch, score) to a JSON file
+        state = {'epoch': epoch + 1, 'best_val_f1': self.best_val_f1}
+        with open(CFG.STATE_FILE_PATH, 'w') as f:
+            json.dump(state, f)
+
+        # Save model, optimizer, and scheduler states
+        torch.save(self.model.state_dict(), CFG.MODEL_STATE_PATH)
+        torch.save(self.optimizer.state_dict(), CFG.OPTIMIZER_STATE_PATH)
+        torch.save(self.scheduler.state_dict(), CFG.SCHEDULER_STATE_PATH)
+        logging.info(f"💾 Checkpoint for epoch {epoch} saved to {CFG.CHECKPOINT_DIR}")
+
+        # Save the best model weights separately for convenience and final use
+        if is_best:
+            torch.save(self.model.state_dict(), CFG.BEST_MODEL_PATH)
+            logging.info(f"🏆 New best GNN model saved to {CFG.BEST_MODEL_PATH} with F1: {self.best_val_f1:.4f}")
+
+    def load_checkpoint(self):
+        """Loads training state from separate files to resume an interrupted run."""
+        # The JSON state file is the primary indicator of a valid checkpoint
+        if os.path.exists(CFG.STATE_FILE_PATH):
+            try:
+                logging.info("Found checkpoint files. Attempting to resume training.")
+                print("This code is resumable and checkpoint files were found!")
+
+                # Load training state (epoch number, best score)
+                with open(CFG.STATE_FILE_PATH, 'r') as f:
+                    state = json.load(f)
+                self.start_epoch = state['epoch']
+                self.best_val_f1 = state['best_val_f1']
+                logging.info(f"Loaded state: Resuming from epoch {self.start_epoch}, best F1 so far: {self.best_val_f1:.4f}")
+
+                # Load model, optimizer, and scheduler states
+                self.model.load_state_dict(torch.load(CFG.MODEL_STATE_PATH, map_location=CFG.DEVICE))
+                self.optimizer.load_state_dict(torch.load(CFG.OPTIMIZER_STATE_PATH, map_location=CFG.DEVICE))
+                self.scheduler.load_state_dict(torch.load(CFG.SCHEDULER_STATE_PATH, map_location=CFG.DEVICE))
+
+                logging.info(f"✅ Successfully resumed training from epoch {self.start_epoch}.")
+            except Exception as e:
+                logging.error(f"Error loading checkpoint: {e}. Starting from scratch.", exc_info=True)
+                self.start_epoch = 0
+                self.best_val_f1 = -1.0
+        else:
+            logging.info("No checkpoint found, starting training from scratch.")
+
+    def train_one_epoch(self, epoch):
+        self.model.train(); total_loss = 0
+        pbar = tqdm(self.dataloaders['train'], desc=f"Epoch {epoch}/{CFG.EPOCHS-1} [Training]")
+        for batch in pbar:
+            self.optimizer.zero_grad(set_to_none=True)
+            ids, mask = batch["input_ids"].to(CFG.DEVICE), batch["attention_mask"].to(CFG.DEVICE)
+            props, lbls = batch["prop_features"].to(CFG.DEVICE), batch["labels"].to(CFG.DEVICE)
+            t, node_idx = batch["t"].to(CFG.DEVICE), batch["indices"].to(CFG.DEVICE)
+            edge_idx = self._create_batch_graph(props)
+            with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+                logits = self.model(ids, mask, props, t, edge_idx, node_idx)
+                loss = self.criterion(logits, lbls)
+            self.scaler.scale(loss).backward(); self.scaler.unscale_(self.optimizer)
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), CFG.GRAD_CLIP_NORM)
+            self.scaler.step(self.optimizer); self.scaler.update(); self.scheduler.step()
+            total_loss += loss.item()
+            pbar.set_postfix({"Loss": f"{loss.item():.4f}", "LR": f"{self.scheduler.get_last_lr()[0]:.2e}"})
+        return total_loss / len(pbar)
+
+    def evaluate(self, loader, desc="[Validation]"):
+        self.model.eval(); all_preds, all_labels = [], []
+        with torch.no_grad():
+            for batch in tqdm(loader, desc=desc):
+                ids, mask = batch["input_ids"].to(CFG.DEVICE), batch["attention_mask"].to(CFG.DEVICE)
+                props, lbls = batch["prop_features"].to(CFG.DEVICE), batch["labels"].to(CFG.DEVICE)
+                t, node_idx = batch["t"].to(CFG.DEVICE), batch["indices"].to(CFG.DEVICE)
+                edge_idx = self._create_batch_graph(props)
+                with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+                    logits = self.model(ids, mask, props, t, edge_idx, node_idx)
+                all_preds.append(logits.argmax(1).cpu()); all_labels.append(lbls.cpu())
+        preds, labels = torch.cat(all_preds), torch.cat(all_labels)
+        return {"f1": f1_score(labels, preds, average='weighted'), "acc": accuracy_score(labels, preds)}
+
+    def get_final_embeddings(self, loader, desc):
+        self.model.eval(); all_embeddings, all_labels = [], []
+        with torch.no_grad():
+            for batch in tqdm(loader, desc=desc):
+                ids, mask = batch["input_ids"].to(CFG.DEVICE), batch["attention_mask"].to(CFG.DEVICE)
+                props, lbls = batch["prop_features"].to(CFG.DEVICE), batch["labels"].to(CFG.DEVICE)
+                t, node_idx = batch["t"].to(CFG.DEVICE), batch["indices"].to(CFG.DEVICE)
+                edge_idx = self._create_batch_graph(props)
+                with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+                    emb = self.model(ids, mask, props, t, edge_idx, node_idx, return_embeddings=True)
+                all_embeddings.append(emb.cpu().to(torch.float32)); all_labels.append(lbls.cpu())
+        return torch.cat(all_embeddings).numpy(), torch.cat(all_labels).numpy()
+
+    def run(self):
+        logging.info("--- STAGE 1: Training the Classical Graph Transformer ---")
+        for epoch in range(self.start_epoch, CFG.EPOCHS):
+            avg_loss = self.train_one_epoch(epoch)
+            val_metrics = self.evaluate(self.dataloaders['val'])
+
+            is_best = val_metrics['f1'] > self.best_val_f1
+            if is_best:
+                self.best_val_f1 = val_metrics['f1']
+
+            log_summary = (
+                f"\n{'='*25} EPOCH {epoch} SUMMARY {'='*25}\n"
+                f"| Avg Train Loss: {avg_loss:.4f}\n"
+                f"| Validation F1:  {val_metrics['f1']:.4f}\n"
+                f"| Validation Acc: {val_metrics['acc']:.4f}\n"
+                f"| Best F1 So Far: {self.best_val_f1:.4f}\n"
+                f"{'='*67}"
+            )
+            logging.info(log_summary)
+
+            self.save_checkpoint(epoch, is_best)
+
+        logging.info("\n--- STAGE 2: Quantum Kernel Evaluation ---")
+        if not os.path.exists(CFG.BEST_MODEL_PATH):
+            return logging.error("No best model checkpoint found for final evaluation.")
+
+        logging.info(f"Loading best GNN model from: {CFG.BEST_MODEL_PATH}")
+        self.model.load_state_dict(torch.load(CFG.BEST_MODEL_PATH))
+
+        train_emb, train_lbls = self.get_final_embeddings(self.dataloaders['train'], "Extracting Train Embeddings")
+        val_emb, val_lbls = self.get_final_embeddings(self.dataloaders['val'], "Extracting Val Embeddings")
+        test_emb, test_lbls = self.get_final_embeddings(self.dataloaders['test'], "Extracting Test Embeddings")
+
+        scaler = StandardScaler(); train_emb_s = scaler.fit_transform(train_emb)
+        val_emb_s = scaler.transform(val_emb); test_emb_s = scaler.transform(test_emb)
+        train_k = self.qke.calculate_kernel_matrix(train_emb_s)
+        val_k = self.qke.calculate_kernel_matrix(val_emb_s, train_emb_s)
+        test_k = self.qke.calculate_kernel_matrix(test_emb_s, train_emb_s)
+
+        svm = SVC(kernel='precomputed', probability=True, random_state=CFG.SEED).fit(train_k, train_lbls)
+        logging.info("✅ SVM classifier trained.")
+
+        for name, kernel, labels in [("Validation", val_k, val_lbls), ("Test", test_k, test_lbls)]:
+            preds, probs = svm.predict(kernel), svm.predict_proba(kernel)[:, 1]
+            metrics = {
+                "Accuracy": accuracy_score(labels, preds), "F1 Score": f1_score(labels, preds, average='weighted'),
+                "Precision": precision_score(labels, preds, average='weighted'), "Recall": recall_score(labels, preds, average='weighted'),
+                "ROC AUC": roc_auc_score(labels, probs)
+            }
+            logging.info(f"--- QKE Final Performance on {name} Set ---"); [logging.info(f"{m}: {v:.4f}") for m, v in metrics.items()]
+
+        np.savez_compressed('classical_embeddings.npz', train_emb=train_emb_s, train_labels=train_lbls, val_emb=val_emb_s, val_labels=val_lbls, test_emb=test_emb_s, test_labels=test_lbls)
+        logging.info("✅ Classical embeddings and labels saved.")
+        logging.info("✅ Full pipeline execution complete!")
+
+# === EXECUTION SCRIPT STARTS HERE ===
+logging.info("--- Preparing Data ---")
+df = pd.read_csv(CFG.DATA_PATH)
+df.dropna(subset=[CFG.TEXT_COL, CFG.TARGET_COL, CFG.TIMESTAMP_COL], inplace=True)
+df[CFG.TARGET_COL] = df[CFG.TARGET_COL].astype(int)
+df['URLs'] = df['URLs'].notna().astype(int)
+for col in CFG.FEATURE_COLS: df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+df[CFG.TIMESTAMP_COL] = pd.to_datetime(df[CFG.TIMESTAMP_COL], errors='coerce', format='mixed').astype(np.int64) / 10**9
+df[CFG.TIMESTAMP_COL] = (df[CFG.TIMESTAMP_COL] - df[CFG.TIMESTAMP_COL].mean()) / (df[CFG.TIMESTAMP_COL].std() + 1e-8)
+df.sort_values(by=CFG.TIMESTAMP_COL, inplace=True); df.reset_index(drop=True, inplace=True)
+prop_matrix = df[CFG.FEATURE_COLS].values.astype(np.float32)
+prop_norm = (prop_matrix - prop_matrix.mean(axis=0)) / (prop_matrix.std(axis=0) + 1e-8)
+prop_tensor = torch.from_numpy(prop_norm)
+num_nodes = len(df)
+logging.info(f"Data loaded. Samples: {len(df)}, Unique Nodes: {num_nodes}")
+
+indices = np.arange(len(df))
+train_indices, temp_indices = train_test_split(indices, test_size=0.3, random_state=CFG.SEED, stratify=df[CFG.TARGET_COL])
+val_indices, test_indices = train_test_split(temp_indices, test_size=0.5, random_state=CFG.SEED, stratify=df.iloc[temp_indices][CFG.TARGET_COL])
+
+datasets = {
+    'train': DisinformationDataset(df.iloc[train_indices][CFG.TEXT_COL].tolist(), prop_tensor[train_indices], df.iloc[train_indices][CFG.TARGET_COL].values, train_indices, df.iloc[train_indices][CFG.TIMESTAMP_COL].values),
+    'val': DisinformationDataset(df.iloc[val_indices][CFG.TEXT_COL].tolist(), prop_tensor[val_indices], df.iloc[val_indices][CFG.TARGET_COL].values, val_indices, df.iloc[val_indices][CFG.TIMESTAMP_COL].values),
+    'test': DisinformationDataset(df.iloc[test_indices][CFG.TEXT_COL].tolist(), prop_tensor[test_indices], df.iloc[test_indices][CFG.TARGET_COL].values, test_indices, df.iloc[test_indices][CFG.TIMESTAMP_COL].values)
+}
+
+tokenizer = AutoTokenizer.from_pretrained(CFG.BASE_MODEL)
+dataloaders = {name: DataLoader(ds, batch_size=CFG.BATCH_SIZE, shuffle=(name=='train'), collate_fn=create_collate_fn(tokenizer), num_workers=CFG.NUM_WORKERS, pin_memory=True, drop_last=(name=='train')) for name, ds in datasets.items()}
+logging.info("✅ Data pipeline is ready.")
+
+roberta_model = load_roberta_with_lora()
+model = HybridDisinformationDetector(roberta_model, prop_tensor.shape[1], num_nodes, len(df[CFG.TARGET_COL].unique()))
+trainer = Trainer(model, dataloaders)
+logging.info("✅ All models and the Trainer have been instantiated.")
+
+try:
+    trainer.run()
+except Exception as e:
+    logging.error(f"A critical error occurred: {e}", exc_info=True)
+finally:
+    logging.info("--- Execution finished. ---")
+    gc.collect()
+    if torch.cuda.is_available(): torch.cuda.empty_cache()
