@@ -18,17 +18,17 @@ Dataset:
     year={2019}
 }
 
-Step	              7500
-Training Loss      0.428600
-Validation Loss    0.411746	  
-Accuracy	          0.835924
-Macro F1	          0.811398
-Brier Score        0.038898
-Pr Auc Macro       0.905520
-F1 Class 0         0.891238
-F1 Class 1         0.795273
-F1 Class 2         0.721720
-F1 Class 3         0.737957
-F1 Class 4         0.831421
-F1 Class 5         0.890783
+ Step	              7500
+ Training Loss      0.428600
+ Validation Loss    0.411746	  
+ Accuracy	          0.835924
+ Macro F1	          0.811398
+ Brier Score        0.038898
+ Pr Auc Macro       0.905520
+ F1 Class 0         0.891238
+ F1 Class 1         0.795273
+ F1 Class 2         0.721720
+ F1 Class 3         0.737957
+ F1 Class 4         0.831421
+ F1 Class 5         0.890783
           			
