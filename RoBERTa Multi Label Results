@@ -1,0 +1,15 @@
+
+Step	7500
+Training Loss	0.428600
+Validation Loss	   0.411746	  
+Accuracy	
+Macro F1	
+Brier Score	
+Pr Auc Macro	
+F1 Class 0	
+F1 Class 1	
+F1 Class 2	
+F1 Class 3	
+F1 Class 4	
+F1 Class 5       0.890783
+          0.835924	0.811398	0.038898	0.905520	  0.891238	    0.795273	  0.721720	  0.737957	  0.831421	  0.890783
