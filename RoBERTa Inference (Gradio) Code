@@ -119,41 +119,35 @@ def classify_text(text_input):
     return predicted_label, uncertainty_score, confidence_scores
 
 # --- 5. Gradio Interface ---
-# Define a modern, minimalistic theme
+# Define a modern, minimalistic theme with a white background, black text, and blue accents
 modern_theme = gr.themes.Base(
     primary_hue=gr.themes.colors.blue,
     secondary_hue=gr.themes.colors.blue,
-    neutral_hue=gr.themes.colors.slate,
+    neutral_hue=gr.themes.colors.gray,
 ).set(
-    body_background_fill="#111111",
-    body_background_fill_dark="#111111",
-    body_text_color="white",
-    body_text_color_dark="white",
-    background_fill_primary="#222222",
-    background_fill_primary_dark="#222222",
-    block_background_fill="#222222",
-    block_background_fill_dark="#222222",
-    block_label_background_fill="#111111",
-    block_label_background_fill_dark="#111111",
+    body_background_fill="#FFFFFF",
+    body_text_color="#111827",
+    background_fill_primary="#F9FAFB",
+    block_background_fill="#F9FAFB",
+    block_border_width="1px",
+    block_label_background_fill="#FFFFFF",
     block_title_text_color="*primary_500",
-    block_title_text_color_dark="*primary_500",
     button_primary_background_fill="*primary_600",
     button_primary_background_fill_hover="*primary_500",
-    button_primary_text_color="white",
-    border_color_accent_dark="*primary_600",
-    border_color_primary_dark="*neutral_700",
-    link_text_color="*primary_400",
-    link_text_color_hover="*primary_300",
-    link_text_color_visited="*primary_500",
+    button_primary_text_color="#FFFFFF",
+    border_color_primary="#E5E7EB",
+    link_text_color="*primary_500",
+    link_text_color_hover="*primary_400",
+    link_text_color_visited="*primary_600",
 )
 
 
-with gr.Blocks(theme=modern_theme, title="Disinformation Detector", css=".gradio-container {background: #111111}") as demo:
+with gr.Blocks(theme=modern_theme, title="Disinformation Detector", css=".gradio-container {background: #FFFFFF}") as demo:
     gr.Markdown(
         """
         <div style="text-align: center; padding: 20px;">
-            <h1 style="color: #FFFFFF; font-size: 2.5em;">🕵️ Disinformation Detector</h1>
-            <p style="color: #CCCCCC; font-size: 1.1em;">Enter a news headline or text to classify its disinformation type.</p>
+            <h1 style="color: #000000; font-size: 2.5em;">🕵️ Disinformation Detector</h1>
+            <p style="color: #555555; font-size: 1.1em;">Enter a news headline or text to classify its disinformation type.</p>
         </div>
         """
     )
@@ -169,10 +163,10 @@ with gr.Blocks(theme=modern_theme, title="Disinformation Detector", css=".gradio
             predicted_label_output = gr.Textbox(label="Top Prediction", interactive=False)
             uncertainty_output = gr.Textbox(label="Uncertainty Score (Entropy)", interactive=False)
 
-    gr.Markdown("<hr style='border: 1px solid #333;'/>")
+    gr.Markdown("<hr style='border: 1px solid #E5E7EB;'/>")
 
     gr.Markdown(
-        "<h3 style='text-align: center; color: #FFFFFF;'>Prediction Breakdown</h3>"
+        "<h3 style='text-align: center; color: #000000;'>Prediction Breakdown</h3>"
     )
     confidence_scores_output = gr.Label(label="Ranked Probabilities", num_top_classes=6)
 
