@@ -1,3 +1,17 @@
+# To install: pip install tavily-python
+from tavily import TavilyClient
+client = TavilyClient("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")
+response = client.search(
+    query="Irish Presidential Election Results",
+    include_answer="basic",
+    topic="news",
+    time_range="week",
+    include_raw_content="text",
+    country="ireland"
+)
+print(response)
+
+
 {
   "query": "Irish Presidential Election Results",
   "follow_up_questions": null,
