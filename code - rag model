@@ -1,0 +1,907 @@
+# ============================================================================
+# CELL 1: Install Dependencies
+# ============================================================================
+!pip install -q \
+  pinecone[grpc]>=4.0.0 \
+  tavily-python>=0.3.3 \
+  transformers>=4.40.0 \
+  sentence-transformers>=2.7.0 \
+  torch>=2.1.0 \
+  accelerate>=0.25.0 \
+  bitsandbytes>=0.41.0 \
+  pandas>=2.0.0 \
+  numpy>=1.24.0 \
+  tqdm \
+  huggingface_hub \
+  trafilatura \
+  pyarrow \
+  nest_asyncio
+
+print("✅ Installation complete! (Added trafilatura, pyarrow, nest_asyncio)")
+# ============================================================================
+# CELL 2: Imports & Load Secrets
+# ============================================================================
+import os
+import json
+import re
+import time
+import pandas as pd
+import numpy as np
+import hashlib
+import csv
+import gc
+import asyncio
+import sqlite3
+import nest_asyncio
+from pathlib import Path
+from datetime import datetime
+from typing import List, Dict, Optional, Tuple, Set
+from tqdm.auto import tqdm
+import warnings
+warnings.filterwarnings('ignore')
+
+# Apply nest_asyncio to allow asyncio to run in Colab/Jupyter
+nest_asyncio.apply()
+
+import torch
+from sentence_transformers import SentenceTransformer, CrossEncoder
+from pinecone import Pinecone
+from tavily import TavilyClient
+# *** ADDED BitsAndBytesConfig ***
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+import trafilatura
+
+# Load Colab secrets
+from google.colab import userdata
+
+try:
+    TAVILY_API_KEY = userdata.get('TAVILY_API_KEY')
+    HF_TOKEN = userdata.get('HF_TOKEN')
+    PINECONE_API_KEY = userdata.get('pinecone_api')
+
+    if not all([TAVILY_API_KEY, HF_TOKEN, PINECONE_API_KEY]):
+        raise ValueError("One or more API keys not found.")
+
+    print("✅ All API keys loaded")
+except Exception as e:
+    print(f"❌ Error loading secrets: {e}")
+    print("Please add these in Colab Secrets (🔑 icon):")
+    print("  - TAVILY_API_KEY")
+    print("  - HF_TOKEN")
+    print("  - pinecone_api")
+    raise
+
+# GPU Check
+print(f"\n🖥️ GPU: {torch.cuda.is_available()}")
+if torch.cuda.is_available():
+    print(f"    Device: {torch.cuda.get_device_name(0)}")
+    print(f"    VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
+# ============================================================================
+# CELL 3: Database Manager (Handles all logging, caching, and state)
+# ============================================================================
+class DatabaseManager:
+    """Handles all SQLite operations for logging, caching, and state tracking."""
+
+    def __init__(self, db_file="pipeline.db"):
+        self.db_file = db_file
+        self.conn = self._create_connection()
+        self._create_tables()
+
+    def _create_connection(self):
+        try:
+            conn = sqlite3.connect(self.db_file, check_same_thread=False)
+            conn.row_factory = sqlite3.Row
+            print(f"✅ Connected to SQLite database: {self.db_file}")
+            return conn
+        except sqlite3.Error as e:
+            print(f"❌ SQLite error: {e}")
+            raise
+
+    def _create_tables(self):
+        with self.conn:
+            # Tracks the state of each article through the pipeline
+            self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS processed_articles (
+                article_id TEXT PRIMARY KEY,
+                stage1_status TEXT DEFAULT 'pending',
+                stage2_status TEXT DEFAULT 'pending',
+                stage3_status TEXT DEFAULT 'pending',
+                last_updated TIMESTAMP
+            )""")
+
+            # Stage 1: Claims and HyDE docs
+            self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS stage1_claims (
+                claim_id TEXT PRIMARY KEY,
+                article_id TEXT,
+                claim_num INTEGER,
+                claim_text TEXT,
+                hyde_doc TEXT,
+                FOREIGN KEY (article_id) REFERENCES processed_articles (article_id)
+            )""")
+
+            # Stage 1: Knowledge Graph Triplets
+            self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS stage1_triplets (
+                triplet_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                claim_id TEXT,
+                subject TEXT,
+                predicate TEXT,
+                object TEXT,
+                FOREIGN KEY (claim_id) REFERENCES stage1_claims (claim_id)
+            )""")
+
+            # Stage 2: Sources, scores, and Pinecone IDs
+            self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS stage2_sources (
+                pinecone_id TEXT PRIMARY KEY,
+                claim_id TEXT,
+                url TEXT,
+                title TEXT,
+                author_or_source TEXT,
+                date TEXT,
+                cleaned_text TEXT,
+                relevance_score REAL,
+                FOREIGN KEY (claim_id) REFERENCES stage1_claims (claim_id)
+            )""")
+
+            # Stage 3: Verification status
+            self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS stage3_verification (
+                pinecone_id TEXT PRIMARY KEY,
+                verification_status TEXT,
+                FOREIGN KEY (pinecone_id) REFERENCES stage2_sources (pinecone_id)
+            )""")
+
+            # Cache: Tavily search results
+            self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS cache_search (
+                query_hash TEXT PRIMARY KEY,
+                results_json TEXT,
+                timestamp TIMESTAMP
+            )""")
+        print("✅ All database tables initialized.")
+
+    def is_processed(self, article_id: str, stage: str) -> bool:
+        """Checks if an article has completed a specific stage."""
+        cur = self.conn.cursor()
+        cur.execute(f"SELECT {stage}_status FROM processed_articles WHERE article_id = ?", (article_id,))
+        row = cur.fetchone()
+        # Returns True if status is 'success' OR 'skipped'
+        return row and row[f"{stage}_status"] in ('success', 'skipped')
+
+    def mark_processed(self, article_id: str, stage: str, status: str = 'success'):
+        """Marks an article's stage as complete."""
+        with self.conn:
+            self.conn.execute(
+                f"""
+                INSERT INTO processed_articles (article_id, {stage}_status, last_updated)
+                VALUES (?, ?, ?)
+                ON CONFLICT(article_id) DO UPDATE SET
+                    {stage}_status = excluded.{stage}_status,
+                    last_updated = excluded.last_updated
+                """, (article_id, status, datetime.now())
+            )
+
+    # *** UPDATED FUNCTION to take the new structured data ***
+    def log_claims_and_triplets(self, article_id: str, structured_data: Dict):
+        """Logs all claims, HyDE docs, and triplets from the structured JSON."""
+        with self.conn:
+            for i, point_data in enumerate(structured_data.get('main_points', []), 1):
+                claim_id = f"{article_id}_c{i}"
+                self.conn.execute("""
+                INSERT OR REPLACE INTO stage1_claims (claim_id, article_id, claim_num, claim_text, hyde_doc)
+                VALUES (?, ?, ?, ?, ?)
+                """, (
+                    claim_id,
+                    article_id,
+                    i,
+                    point_data.get('point'),
+                    point_data.get('hyde_doc')
+                ))
+
+                for triplet in point_data.get('triplets', []):
+                    if isinstance(triplet, list) and len(triplet) == 3:
+                        self.conn.execute("""
+                        INSERT INTO stage1_triplets (claim_id, subject, predicate, object)
+                        VALUES (?, ?, ?, ?)
+                        """, (claim_id, triplet[0], triplet[1], triplet[2]))
+
+    def get_claims_for_stage2(self) -> List[sqlite3.Row]:
+        """Gets all claims that haven't finished Stage 2."""
+        cur = self.conn.cursor()
+        cur.execute("""
+        SELECT c.* FROM stage1_claims c
+        JOIN processed_articles pa ON c.article_id = pa.article_id
+        WHERE pa.stage1_status = 'success' AND pa.stage2_status != 'success'
+        """)
+        return cur.fetchall()
+
+    def get_sources_for_stage3(self) -> List[sqlite3.Row]:
+        """Gets all sources that haven't finished Stage 3."""
+        cur = self.conn.cursor()
+        cur.execute("""
+        SELECT s.*, c.claim_text FROM stage2_sources s
+        JOIN stage1_claims c ON s.claim_id = c.claim_id
+        JOIN processed_articles pa ON c.article_id = pa.article_id
+        WHERE pa.stage2_status = 'success' AND pa.stage3_status != 'success'
+        """)
+        return cur.fetchall()
+
+    def log_source(self, pinecone_id, claim_id, src_data, cleaned_text, score):
+        with self.conn:
+            self.conn.execute("""
+            INSERT OR REPLACE INTO stage2_sources
+            (pinecone_id, claim_id, url, title, author_or_source, date, cleaned_text, relevance_score)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                pinecone_id, claim_id, src_data['url'], src_data['title'],
+                src_data['author_or_source'], src_data['date'], cleaned_text, score
+            ))
+
+    def log_verification(self, pinecone_id, status):
+        with self.conn:
+            self.conn.execute("""
+            INSERT OR REPLACE INTO stage3_verification (pinecone_id, verification_status)
+            VALUES (?, ?)
+            """, (pinecone_id, status))
+
+    def get_search_cache(self, query: str) -> Optional[List[Dict]]:
+        query_hash = hashlib.md5(query.encode()).hexdigest()
+        cur = self.conn.cursor()
+        cur.execute("SELECT results_json FROM cache_search WHERE query_hash = ?", (query_hash,))
+        row = cur.fetchone()
+        return json.loads(row['results_json']) if row else None
+
+    def set_search_cache(self, query: str, results: List[Dict]):
+        query_hash = hashlib.md5(query.encode()).hexdigest()
+        with self.conn:
+            self.conn.execute("""
+            INSERT OR REPLACE INTO cache_search (query_hash, results_json, timestamp)
+            VALUES (?, ?, ?)
+            """, (query_hash, json.dumps(results), datetime.now()))
+
+print("✅ DatabaseManager class defined.")
+# ============================================================================
+# CELL 4: Tavily Client (UPDATED for Topic & Async)
+# ============================================================================
+class SafeTavily:
+    """Tavily with credit tracking and async search."""
+
+    def __init__(self, api_key: str, max_credits: int = 1000):
+        self.client = TavilyClient(api_key=api_key)
+        self.max_credits = max_credits
+        self.credits_used = self._load_credits()
+        print(f"💳 Tavily: {self.credits_used}/{self.max_credits} credits used")
+
+    def _load_credits(self) -> int:
+        f = Path("tavily_credits.txt")
+        return int(f.read_text().strip()) if f.exists() else 0
+
+    def _save_credits(self):
+        Path("tavily_credits.txt").write_text(str(self.credits_used))
+
+    def can_search(self) -> bool:
+        return self.credits_used < (self.max_credits - 50)
+
+    def _parse_results(self, response: Dict) -> List[Dict]:
+        sources = []
+        for result in response.get('results', []):
+            metadata = result.get('metadata', {})
+            date = metadata.get('publication_date', '')
+            author_or_source = metadata.get('source', '')
+
+            sources.append({
+                'url': result.get('url', ''),
+                'raw_text': result.get('raw_content', result.get('content', '')),
+                'title': result.get('title', ''),
+                'date': date,
+                'author_or_source': author_or_source
+            })
+        return sources
+
+    async def async_search(self, query: str, db: DatabaseManager) -> List[Dict]:
+        """Performs an async search, using cache if available."""
+        if not self.can_search():
+            print(f"  ❌ Credits exhausted ({self.credits_used}/{self.max_credits})")
+            return []
+
+        # Check cache first
+        cached_results = db.get_search_cache(query)
+        if cached_results:
+            print(f"  ✅ Cache hit: {query[:50]}...")
+            return cached_results
+
+        print(f"  🔍 Tavily search: {query[:50]}...")
+        try:
+            response = await self.client.search(
+                query=query,
+                search_depth="basic",
+                max_results=3,
+                include_raw_content=True, # We need raw HTML for trafilatura
+                include_metadata=True,
+                topic="news" # *** ADDED as requested ***
+            )
+
+            self.credits_used += 1
+            self._save_credits()
+
+            sources = self._parse_results(response)
+            db.set_search_cache(query, sources) # Save to cache
+
+            print(f"  ✅ Found {len(sources)} sources (credit #{self.credits_used})")
+            return sources
+
+        except Exception as e:
+            print(f"  ❌ Tavily error: {e}")
+            return []
+
+print("✅ SafeTavily class defined with async support and topic='news'.")
+# ============================================================================
+# CELL 5: Initialize Pinecone
+# ============================================================================
+print("\n🔌 Connecting to Pinecone...")
+pc = Pinecone(api_key=PINECONE_API_KEY)
+
+INDEX_NAME = "ai-article-cache"
+INDEX_HOST = "https://ai-article-cache-rc9q4en.svc.aped-4627-b74a.pinecone.io"
+
+try:
+    index = pc.Index(name=INDEX_NAME, host=INDEX_HOST)
+    stats = index.describe_index_stats()
+
+    if stats.dimension != 4096:
+        print(f"❌ Pinecone Error: Index dimension is {stats.dimension}, but model is 4096.")
+        raise ValueError("Incorrect Pinecone index dimension")
+
+    print(f"✅ Connected to Pinecone")
+    print(f"    Index: {INDEX_NAME}")
+    print(f"    Dimensions: {stats.dimension}")
+    print(f"    Vectors: {stats.total_vector_count}")
+
+except Exception as e:
+    print(f"❌ Pinecone error: {e}")
+    raise
+# ============================================================================
+# CELL 6: STAGE 1 - (NEW: Reliable 6-Call Method)
+# ============================================================================
+
+def _load_llama_model():
+    """Loads and compiles the Llama 8B model."""
+    print("\n🚀 Loading Llama 3 8B...")
+
+    # *** FIXED: Use BitsAndBytesConfig to remove deprecation warning ***
+    bnb_config = BitsAndBytesConfig(load_in_8bit=True)
+
+    model = AutoModelForCausalLM.from_pretrained(
+        "meta-llama/Llama-3.1-8B-Instruct",
+        quantization_config=bnb_config,
+        device_map="auto",
+        token=HF_TOKEN
+    )
+    tokenizer = AutoTokenizer.from_pretrained(
+        "meta-llama/Llama-3.1-8B-Instruct",
+        token=HF_TOKEN
+    )
+    print("✅ Llama 8B loaded")
+
+    try:
+        print("\nApplying torch.compile() to Llama 8B...")
+        model = torch.compile(model, mode="reduce-overhead")
+        print("✅ torch.compile() applied to Llama.")
+    except Exception as e:
+        print(f"⚠️ torch.compile() failed: {e}")
+
+    return model, tokenizer
+
+def _unload_llama_model(model, tokenizer):
+    """Unloads Llama 8B from VRAM."""
+    print("\n🗑️ Unloading Llama 8B from VRAM...")
+    del model
+    del tokenizer
+    gc.collect()
+    torch.cuda.empty_cache()
+    print("✅ Llama 8B unloaded.")
+    print(f"    VRAM Used: {torch.cuda.memory_allocated(0) / 1e9:.2f} GB")
+
+@torch.no_grad()
+def _run_llama_gen(prompt: str, model, tokenizer, max_new_tokens: int) -> str:
+    """Helper to run generation with the loaded model."""
+    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=4096).to(model.device)
+    outputs = model.generate(
+        **inputs,
+        max_new_tokens=max_new_tokens,
+        temperature=0.1,
+        do_sample=True,
+        pad_token_id=tokenizer.eos_token_id
+    )
+    response = tokenizer.decode(outputs[0], skip_special_tokens=True)
+    if "assistant" in response:
+        return response.split("assistant")[-1].strip()
+    return response.split(prompt.split("<|eot_id|>")[-2])[-1].strip()
+
+
+def extract_main_points(title: str, text: str, model, tokenizer) -> List[str]:
+    """
+    Call 1: Gets 3-5 main bullet points (summarization).
+    """
+    prompt = f"""<|begin_of_text|><|start_header_id|>system<|end_header_id|>
+You are an expert summarizer. Your task is to read the following article and list the 3-5 most important bullet points that capture the main ideas of the text.
+Treat the article's content as given, even if it is satirical or absurd. Your goal is to summarize the primary points, not fact-check them.
+List 3-5 points. Do not add any other text.
+<|eot_id|><|start_header_id|>user<|end_header_id|>
+Title: {title}
+Text: {text}
+Extract 3-5 main bullet points (one per line):
+1.<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+"""
+    response = _run_llama_gen(prompt, model, tokenizer, max_new_tokens=600)
+    points = []
+    for line in response.split('\n'):
+        line = line.strip()
+        if line and any(line.startswith(str(i)) for i in range(1, 10)):
+            point = line.split('.', 1)[-1].strip()
+            if len(point) > 10: # Filter out short junk
+                points.append(point)
+    return points[:5] # Return however many were found, up to 5
+
+
+def get_hyde_and_triplets(main_point: str, model, tokenizer) -> Dict:
+    """
+    Calls 2-6: Gets HyDE doc and Triplets for a *single* point.
+    This generates a small, reliable JSON.
+    """
+    prompt = f"""<|begin_of_text|><|start_header_id|>system<|end_header_id|>
+You are an expert data extractor. For the given "Main Point", perform two tasks:
+1.  **Generate HyDE:** Write a short, one-paragraph hypothetical document that elaborates on the point.
+2.  **Extract Triplets:** Extract all (Subject, Predicate, Object) triplets from the main point.
+
+You MUST provide your response in a single, valid JSON object. Do not add any text before or after the JSON.
+Format:
+{{
+  "hyde_doc": "A short hypothetical paragraph elaborating on the point.",
+  "triplets": [
+    ["Subject1", "Predicate1", "Object1"],
+    ["Subject2", "Predicate2", "Object2"]
+  ]
+}}
+<|eot_id|><|start_header_id|>user<|end_header_id|>
+Main Point: {main_point}
+Provide the output as a single, valid JSON object:
+<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+"""
+    response = _run_llama_gen(prompt, model, tokenizer, max_new_tokens=512)
+
+    # Robust JSON parsing
+    try:
+        # Find the first '{' and last '}'
+        start_idx = response.find('{')
+        end_idx = response.rfind('}')
+        if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
+            json_str = response[start_idx : end_idx + 1]
+            data = json.loads(json_str)
+            # Ensure keys exist
+            if 'hyde_doc' not in data: data['hyde_doc'] = ""
+            if 'triplets' not in data: data['triplets'] = []
+            return data
+        else:
+            print(f"  ⚠️ No JSON found for point: {main_point[:30]}...")
+            return {"hyde_doc": "", "triplets": []}
+    except Exception as e:
+        print(f"  ⚠️ Failed to parse JSON for point: {main_point[:30]}... Error: {e}")
+        return {"hyde_doc": "", "triplets": []}
+
+
+def run_stage_1(input_csv: str):
+    """
+    Runs the full Stage 1 with the reliable 1 + 5 call method.
+    """
+    print(f"\n{'#'*60}")
+    print(f"RUNNING STAGE 1: (Reliable 6-Call) Main Points, HyDE, KG")
+    print(f"{'#'*60}")
+
+    db = DatabaseManager()
+    model, tokenizer = _load_llama_model()
+
+    try:
+        df = pd.read_csv(input_csv)
+    except FileNotFoundError:
+        print(f"❌ Error: Input file '{input_csv}' not found.")
+        _unload_llama_model(model, tokenizer)
+        return
+
+    output_file = "step1_claims_data.csv"
+    header = [
+        'article_id', 'title', 'text', 'label',
+        'claim_1', 'claim_2', 'claim_3', 'claim_4', 'claim_5'
+    ]
+
+    processed_hashes_stage1 = set()
+    if Path(output_file).exists():
+        print(f"Resuming... loading existing file '{output_file}'")
+        try:
+            temp_df = pd.read_csv(output_file)
+            processed_hashes_stage1 = set(temp_df['article_id'])
+            print(f"  Found {len(processed_hashes_stage1)} already processed articles.")
+        except pd.errors.EmptyDataError:
+            print("  Claims file is empty. Starting new.")
+            with open(output_file, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                writer.writerow(header)
+    else:
+        with open(output_file, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow(header)
+
+    print(f"Processing {len(df)} articles for main points...")
+
+    with open(output_file, 'a', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=header, extrasaction='ignore')
+
+        for _, row in tqdm(df.iterrows(), total=len(df), desc="Stage 1: Main Points"):
+            text = str(row.get('text', ''))
+            if not text:
+                continue
+
+            article_id = hashlib.md5(text.encode()).hexdigest()
+
+            if article_id in processed_hashes_stage1 or db.is_processed(article_id, 'stage1'):
+                continue
+
+            print(f"\nProcessing article: {article_id[:10]}...")
+
+            # --- Call 1: Get Main Points ---
+            main_points = extract_main_points(str(row.get('title', '')), text, model, tokenizer)
+
+            if not main_points:
+                print(f"  ⚠️ Skipping, no valid points found.")
+                db.mark_processed(article_id, 'stage1', 'skipped')
+                continue
+
+            print(f"  Found {len(main_points)} points. Generating HyDE docs and KGs...")
+
+            claims_data_for_db = []
+            csv_row = {
+                'article_id': article_id,
+                'title': str(row.get('title', '')),
+                'text': text,
+                'label': str(row.get('label', ''))
+            }
+
+            # --- Calls 2-6: Get HyDE and Triplets (serially, but fast) ---
+            for i, point_text in enumerate(main_points, 1):
+                # This is one call per point
+                point_data = get_hyde_and_triplets(point_text, model, tokenizer)
+
+                claims_data_for_db.append({
+                    'claim_text': point_text,
+                    'hyde_doc': point_data['hyde_doc'],
+                    'triplets': point_data['triplets']
+                })
+                csv_row[f'claim_{i}'] = point_text
+
+            # Log to DB
+            db.log_claims_and_triplets(article_id, claims_data_for_db)
+            db.mark_processed(article_id, 'stage1', 'success')
+
+            # Log to CSV
+            writer.writerow(csv_row)
+
+            processed_hashes_stage1.add(article_id)
+            print(f"  ✅ Saved {len(main_points)} points and all related data.")
+
+    _unload_llama_model(model, tokenizer)
+    print(f"\n{'#'*60}")
+    print(f"✅ STAGE 1: COMPLETE!")
+    print(f"{'#'*60}")
+
+print("✅ Stage 1 function defined.")
+# ============================================================================
+# CELL 7: STAGE 2 - Async Search, Rerank, Embed, Upload (FIXED BNB)
+# ============================================================================
+
+def _load_embedding_models():
+    """Loads Nemotron and the Reranker model."""
+    print("\n🚀 Loading nvidia/llama-embed-nemotron-8b (8-bit)...")
+
+    # *** FIXED: Use BitsAndBytesConfig to remove deprecation warning ***
+    bnb_config = BitsAndBytesConfig(load_in_8bit=True)
+
+    embedding_model = SentenceTransformer(
+        "nvidia/llama-embed-nemotron-8b",
+        trust_remote_code=True,
+        # *** FIXED: Pass config object ***
+        model_kwargs={'quantization_config': bnb_config},
+        device="cuda"
+    )
+    print("✅ Nemotron 8B loaded")
+
+    print("\n🚀 Loading mxbai-rerank-large-v1...")
+    # Reranker model is not quantized, so it's loaded normally.
+    reranker_model = CrossEncoder(
+        'mixedbread-ai/mxbai-rerank-large-v1',
+        device="cuda",
+        max_length=512
+    )
+    print("✅ Reranker loaded")
+
+    try:
+        print("\nApplying torch.compile() to embedding model...")
+        embedding_model = torch.compile(embedding_model, mode="reduce-overhead")
+        print("✅ torch.compile() applied to Nemotron.")
+    except Exception as e:
+        print(f"⚠️ torch.compile() failed for Nemotron: {e}")
+
+    return embedding_model, reranker_model
+
+def _unload_embedding_models(embedding_model, reranker_model):
+    print("\n🗑️ Unloading Nemotron and Reranker from VRAM...")
+    del embedding_model
+    del reranker_model
+    gc.collect()
+    torch.cuda.empty_cache()
+    print("✅ Embedding models unloaded.")
+    print(f"    VRAM Used: {torch.cuda.memory_allocated(0) / 1e9:.2f} GB")
+
+@torch.no_grad()
+def _generate_embeddings(texts: List[str], model) -> np.ndarray:
+    return model.encode(
+        texts,
+        batch_size=16,
+        show_progress_bar=False,
+        normalize_embeddings=True
+    )
+
+@torch.no_grad()
+def _rerank_sources(claim: str, sources: List[Dict], reranker_model) -> List[Tuple[Dict, float]]:
+    """Reranks sources and returns (source, score) tuples."""
+
+    pairs = []
+    cleaned_sources = []
+    for src in sources:
+        cleaned_text = trafilatura.extract(src['raw_text'])
+        if cleaned_text:
+            pairs.append((claim, cleaned_text))
+            cleaned_sources.append((src, cleaned_text)) # Store cleaned text
+
+    if not pairs:
+        return []
+
+    scores = reranker_model.predict(pairs, show_progress_bar=False)
+
+    scored_sources = []
+    for (src, cleaned_text), score in zip(cleaned_sources, scores):
+        src['cleaned_text'] = cleaned_text # Attach cleaned text to the source dict
+        scored_sources.append((src, float(score)))
+
+    return sorted(scored_sources, key=lambda x: x[1], reverse=True)
+
+
+async def _process_article_stage2(article_claims: List[sqlite3.Row], db: DatabaseManager, tavily: SafeTavily, embedding_model, reranker_model, pinecone_index):
+    """Async processing for a single article's claims."""
+    article_id = article_claims[0]['article_id']
+    print(f"\nProcessing Stage 2 for article: {article_id[:10]}...")
+
+    search_tasks = []
+    for claim in article_claims:
+        search_tasks.append(tavily.async_search(claim['hyde_doc'], db))
+
+    print(f"  Launching {len(search_tasks)} async searches...")
+    all_search_results = await asyncio.gather(*search_tasks)
+    print(f"  All searches complete.")
+
+    vectors_to_upload = []
+    log_entries = []
+
+    for claim, search_results in zip(article_claims, all_search_results):
+        if not search_results:
+            continue
+
+        scored_sources = _rerank_sources(claim['claim_text'], search_results, reranker_model)
+
+        for i, (src, score) in enumerate(scored_sources):
+            if score < 0.5: # Relevance threshold
+                continue
+
+            cleaned_text = src['cleaned_text']
+            embedding = _generate_embeddings([cleaned_text], embedding_model)[0]
+            pinecone_id = f"{claim['claim_id']}_s{i+1}"
+
+            vectors_to_upload.append({
+                'id': pinecone_id,
+                'values': embedding.tolist(),
+                'metadata': {
+                    'article_id': article_id,
+                    'claim_num': claim['claim_num'],
+                    'url': src['url'],
+                    'title': src['title'],
+                    'author_or_source': src['author_or_source'],
+                    'date': src['date'],
+                    'relevance_score': score,
+                    'text_preview': cleaned_text[:1000]
+                }
+            })
+
+            log_entries.append((
+                pinecone_id, claim['claim_id'], src, cleaned_text, score
+            ))
+
+    if vectors_to_upload:
+        try:
+            pinecone_index.upsert(vectors=vectors_to_upload, batch_size=100)
+            print(f"  ✅ Uploaded {len(vectors_to_upload)} vectors to Pinecone.")
+
+            for entry in log_entries:
+                db.log_source(*entry)
+            print(f"  ✅ Logged {len(log_entries)} sources to DB.")
+
+        except Exception as e:
+            print(f"  ❌ Pinecone upsert failed: {e}")
+            db.mark_processed(article_id, 'stage2', 'error')
+            return
+
+    db.mark_processed(article_id, 'stage2', 'success')
+
+
+def run_stage_2():
+    """Runs the full Stage 2: Async Search, Rerank, Embed, Upload."""
+    print(f"\n{'#'*60}")
+    print(f"RUNNING STAGE 2: Search, Rerank, Embed")
+    print(f"{'#'*60}")
+
+    db = DatabaseManager()
+    tavily = SafeTavily(TAVILY_API_KEY)
+    embedding_model, reranker_model = _load_embedding_models()
+
+    claims_to_process = db.get_claims_for_stage2()
+
+    if not claims_to_process:
+        print("✅ No articles need Stage 2 processing. All up to date.")
+        _unload_embedding_models(embedding_model, reranker_model)
+        return
+
+    articles_to_process = {}
+    for claim in claims_to_process:
+        article_id = claim['article_id']
+        if article_id not in articles_to_process:
+            articles_to_process[article_id] = []
+        articles_to_process[article_id].append(claim)
+
+    print(f"Found {len(articles_to_process)} articles to process for Stage 2.")
+
+    async def main():
+        print(f"Starting processing for {len(articles_to_process)} articles...")
+        for article_id, claims in tqdm(articles_to_process.items(), desc="Stage 2: Articles"):
+            try:
+                await _process_article_stage2(claims, db, tavily, embedding_model, reranker_model, index)
+            except Exception as e:
+                print(f"  ❌ Unhandled error in article task {article_id}: {e}")
+                db.mark_processed(article_id, 'stage2', 'error')
+
+    asyncio.run(main())
+
+    _unload_embedding_models(embedding_model, reranker_model)
+    print(f"\n{'#'*60}")
+    print(f"✅ STAGE 2: COMPLETE!")
+    print(f"{'#'*60}")
+
+print("✅ Stage 2 function defined.")
+# ============================================================================
+# CELL 9: Helper Function Definitions (Build & Download)
+# ============================================================================
+
+def build_master_file(input_csv: str):
+    """
+    Builds the final Parquet file by joining all data from the SQLite DB.
+    """
+    print("\n🏗️ Building final master file...")
+    db = DatabaseManager()
+    conn = db.conn
+
+    try:
+        # 1. Get original articles
+        source_df = pd.read_csv(input_csv)
+        source_df['article_id'] = source_df['text'].astype(str).apply(
+            lambda x: hashlib.md5(x.encode()).hexdigest()
+        )
+        source_df = source_df[['article_id', 'title', 'text', 'label']].drop_duplicates(subset=['article_id'])
+        print(f"Loaded {len(source_df)} original articles.")
+
+        # 2. Get claims
+        claims_df = pd.read_sql_query("SELECT * FROM stage1_claims", conn)
+        print(f"Loaded {len(claims_df)} claims from DB.")
+
+        # 3. Get sources
+        sources_df = pd.read_sql_query("SELECT * FROM stage2_sources", conn)
+        print(f"Loaded {len(sources_df)} sources from DB.")
+
+        # 4. Get verifications
+        verification_df = pd.read_sql_query("SELECT * FROM stage3_verification", conn)
+        print(f"Loaded {len(verification_df)} verifications from DB.")
+
+        # --- Start Merging ---
+
+        # Pivot claims to be wide
+        claims_wide = claims_df.pivot(
+            index='article_id',
+            columns='claim_num',
+            values=['claim_text', 'hyde_doc', 'claim_id']
+        )
+        claims_wide.columns = [f"{val}_{col}" for val, col in claims_wide.columns]
+
+        # *** RENAME COLUMNS as requested ***
+        claims_wide.rename(columns={
+            'claim_text_1': 'alpha',
+            'claim_text_2': 'beta',
+            'claim_text_3': 'gamma',
+            'claim_text_4': 'claim_4', # Keep 4 and 5 as-is
+            'claim_text_5': 'claim_5'
+        }, inplace=True)
+        print("Pivoted claims and renamed to alpha, beta, gamma.")
+
+        # Merge sources with verifications
+        sources_verified_df = pd.merge(sources_df, verification_df, on='pinecone_id', how='left')
+
+        # Pivot sources to be wide
+        # First, join with claims to get article_id
+        sources_with_article_id = pd.merge(sources_verified_df, claims_df[['claim_id', 'article_id', 'claim_num']], on='claim_id', how='left')
+
+        # Calculate source_num (1-3) within each claim
+        sources_with_article_id['source_num'] = sources_with_article_id.groupby('claim_id')['relevance_score'].rank(method='first', ascending=False)
+
+        sources_wide = sources_with_article_id.pivot_table(
+            index='article_id',
+            columns=['claim_num', 'source_num'],
+            values=['url', 'title', 'author_or_source', 'date', 'cleaned_text', 'relevance_score', 'verification_status', 'pinecone_id'],
+            aggfunc='first'
+        )
+        sources_wide.columns = [f"c{int(c)}_s{int(s)}_{val}" for val, c, s in sources_wide.columns]
+        print("Pivoted sources.")
+
+        # FINAL MERGE
+        final_df = pd.merge(source_df, claims_wide, on='article_id', how='left')
+        final_df = pd.merge(final_df, sources_wide, on='article_id', how='left')
+
+        # Get KG data
+        triplets_df = pd.read_sql_query("SELECT * FROM stage1_triplets", conn)
+        # We'll save this as a separate file, as it doesn't fit the wide format
+        triplets_output_file = "step1_knowledge_graph.parquet"
+        triplets_df.to_parquet(triplets_output_file, index=False)
+        print(f"✅ Saved Knowledge Graph to '{triplets_output_file}'")
+
+    except Exception as e:
+        print(f"❌ Error building master file: {e}")
+        return
+
+    output_file = "step1_master_data_FINAL.parquet"
+    final_df.to_parquet(output_file, index=False)
+
+    print(f"✅ Successfully built '{output_file}' with {len(final_df)} articles.")
+    print(f"\n📥 You can now run download_results() again to get this new file.")
+
+
+def download_results():
+    """Download all generated files"""
+    print("\n📥 Downloading files...")
+
+    files_to_download = [
+        'pipeline.db',                  # The entire database
+        'step1_master_data_FINAL.parquet', # The final master file
+        'step1_knowledge_graph.parquet',# The KG triplets
+        'tavily_credits.txt'
+    ]
+
+    for f in files_to_download:
+        if Path(f).exists():
+            files.download(f)
+            print(f"✅ {f}")
+        else:
+            print(f"⚠️ {f} not found (this is OK if it hasn't been generated yet).")
+
+print("✅ Helper functions build_master_file() and download_results() defined.")
+# ============================================================================
+# CELL 10: --- RUN STAGE 1 (Claims, HyDE, KG) ---
+# This will load Llama 8B, process all articles, and save
+# all claims, HyDE docs, and KG triplets to 'pipeline.db'.
+# ============================================================================
+run_stage_1('news_df.csv')
