@@ -1,6 +1,5 @@
-# ============================================================================
+
 # CELL 0: Setup 'uv' and Environment Cleanup
-# ============================================================================
 # Install 'uv' (Rust-based pip replacement) for superior dependency resolution
 !pip install -q uv
 
@@ -8,41 +7,21 @@
 !rm -f /usr/local/lib/python3.12/dist-packages/~vidia-cusolver-cu12
 print("✅ 'uv' installed and environment cleaned.")
 
-# ============================================================================
-# CELL 1: Targeted vLLM Installation via PyPI CUDA Index (FIXED)
-# ============================================================================
 
-# Use the official vLLM PyPI name, specifying the CUDA version in the index URL.
-# NOTE: vLLM typically builds for CUDA 12.1 (cu121) or 12.2 (cu122).
-# We'll stick to 0.7.3 as planned, and let the index URL guide the install.
+# CELL 1: Targeted vLLM Installation via PyPI CUDA Index 
 
 VLLM_VERSION = "0.7.3"
 CUDA_INDEX_URL = "https://download.pytorch.org/whl/cu121" # Use 121 as the target CUDA version
 
 print(f"🚀 Attempting installation of vLLM v{VLLM_VERSION} via PyPI/CUDA Index...")
-
-# 1. Install vLLM with the specified version and the CUDA index.
-# This ensures a pre-compiled wheel is used, bypassing the compilation issues.
 !uv pip install vllm=={VLLM_VERSION} --extra-index-url {CUDA_INDEX_URL}
-
-# 2. Install flash-attn and xformers without compilation (they may already be satisfied
-#    by the vLLM wheel, but this ensures they are present).
 !uv pip install --no-build-isolation flash-attn xformers
 
 print(f"✅ vLLM (v{VLLM_VERSION} for CUDA 12.1) and core packages installed using 'uv'.")
 
 
+# Cell 2 : Imports
 
-
-
-
-
-
-
-
-# ============================================================================
-# CELL 2: Import All Libraries
-# ============================================================================
 from vllm import LLM, SamplingParams
 from typing import List, Dict, Tuple, Optional
 import json
@@ -61,9 +40,9 @@ import sys # Added for the robust DB manager
 print("✅ All libraries imported successfully.")
 
 
-# ============================================================================
-# CELL 3: ROBUST DatabaseManager (Replaces Stub)
-# ============================================================================
+
+# Cell 3: Database Manager
+
 import sqlite3
 import sys
 from typing import Dict, Optional
@@ -261,15 +240,9 @@ class DatabaseManager:
 
 
 
-# ============================================================================
-# CELL 4: THROUGHPUT-MAX STAGE 1 PIPELINE (FIXED w/ PROGRESSIVE SAVE)
-# ============================================================================
+# Cell 4: Stage 1 Pipeline
 
 class UltraReliableStage1_AWQ:
-    """
-    Ultra-fast, 99%+ reliable Stage 1 processor using vLLM + AWQ.
-    (Class definition is unchanged from before)
-    """
 
     def __init__(self, hf_token: Optional[str] = None):
         self.hf_token = hf_token
@@ -732,17 +705,15 @@ print("   - 99%+ success rate target")
 print("   - <0.5s per article (batched)")
 print("   - Batch size: 32 (optimal for 4-bit + T4)")
 
-# ============================================================================
-# CELL 5: EXECUTE THE PIPELINE
-# ============================================================================
 
-# Ensure you have 'news_df.csv' in your environment
-# For testing, we can create a dummy file:
+
+# Cell 5: Script Execution
 try:
-    pd.read_csv("news_df.csv")
+    pd.read_csv("news_df.csv") # Or any dataset of your choosing
     print("Found news_df.csv")
 except FileNotFoundError:
     print("file not found.")
 
 # Run the optimized pipeline
-run_stage_1_ultra_reliable("news_df.csv", batch_size=30)
+run_stage_1_ultra_reliable("news_df.csv", batch_size=30) # T4 friendly batch size, feel free to increase if on more powerful GPU's
+
