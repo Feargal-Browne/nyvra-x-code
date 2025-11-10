@@ -1,0 +1,17 @@
+# Dependencies to Install
+
+print("Installing all dependencies... This will take a few minutes.")
+print("Step 1: Installing optimum-nvidia and its core dependencies")
+
+# 1. Install optimum-nvidia .
+!pip install -q --pre --extra-index-url https://pypi.nvidia.com optimum-nvidia
+
+# 2. Install all other libraries.
+print("Step 2: Installing remaining libraries...")
+!pip install -q sentence-transformers bitsandbytes
+!pip install -q pinecone-text trafilatura pyarrow pandas tqdm aiohttp
+!pip install -q nest-asyncio langchain_experimental langchain_huggingface
+!pip install -q libsql_client
+
+print("✅ All dependencies installed.")
+print("Please now restart the runtime (Runtime > Restart session)")
