@@ -45,9 +45,8 @@ warnings.filterwarnings("ignore")
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ["WANDB_LOG_MODEL"] = "checkpoint"
 
-# ==============================================================================
-# 2. CONFIGURATION DATACLASS
-# ==============================================================================
+# 2. Configurtaion Dataclass
+
 @dataclass
 class ScriptConfig:
     # Project and Path Configs
@@ -91,9 +90,9 @@ def set_seed(seed_value: int):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed_value)
 
-# ==============================================================================
-# 3. CUSTOM TRAINER FOR CLASS WEIGHTS
-# ==============================================================================
+
+# 3. Custom Trainer for Class Weights
+
 class WeightedTrainer(Trainer):
     def __init__(self, *args, class_weights=None, **kwargs):
         super().__init__(*args, **kwargs)
@@ -112,9 +111,9 @@ class WeightedTrainer(Trainer):
         loss = loss_fct(logits.view(-1, self.model.config.num_labels), labels.view(-1))
         return (loss, outputs) if return_outputs else loss
 
-# ==============================================================================
-# 4. DATA HANDLING FUNCTIONS (Unchanged)
-# ==============================================================================
+
+# 4. Data Handling Functions
+
 def load_and_clean_data(config: ScriptConfig) -> Tuple[Dataset, LabelEncoder]:
     cleaned_data_path = config.cache_dir / "cleaned_dataset"
     label_encoder_path = config.cache_dir / "label_encoder.joblib"
@@ -206,9 +205,8 @@ def prepare_datasets(config: ScriptConfig, tokenizer) -> Tuple[Dataset, Dataset,
     return train_ds, val_ds, test_ds, le, num_classes, class_weights
 
 
-# ==============================================================================
-# 5. EVALUATION & LOGGING FUNCTIONS (Unchanged)
-# ==============================================================================
+# 5. Evaluation and Logging Functions
+
 def compute_metrics(p) -> Dict[str, float]:
     preds = np.argmax(p.predictions, axis=1)
     labels = p.label_ids
@@ -251,9 +249,7 @@ def log_final_visualizations(trainer, test_dataset, label_encoder, run_name):
         wandb.log({"classification_report": wandb.Table(dataframe=report_df)})
         logging.info(f"Classification Report:\n{report_df}")
 
-# ==============================================================================
-# 6. MAIN EXECUTION
-# ==============================================================================
+# Main execution
 def main():
     try:
         if wandb.run is not None:
