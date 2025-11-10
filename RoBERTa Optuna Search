@@ -289,7 +289,7 @@ if __name__ == "__main__":
         print("\n🛑 Optimization interrupted or pruned.")
 
     if study.best_trial:
-        print("\n\n🎉 ===== OPTIMIZATION FINISHED ===== 🎉")
+        print("\n\n🎉 Optimization Finished 🎉")
         print(f" 🏆 Best Value (macro_f1): {study.best_trial.value:.4f}")
         print(" 📋 Best Params:")
         for key, value in study.best_trial.params.items():
